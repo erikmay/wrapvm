@@ -1,0 +1,46 @@
+# wrapvm as a smolvm machine: the desktop image CI publishes from ./Containerfile,
+# with the directory you create the machine from mounted as the workspace.
+# Credentials stay on the host. ./wrapvm does all of this per directory.
+#
+#   smolvm machine create --name proj -s path/to/Smolfile -p 6080:6080   # from the project dir
+#   GH_TOKEN="Basic $(printf 'x-access-token:%s' "$(gh auth token)" | base64 | tr -d '\n')" \
+#     smolvm machine start --name proj                                   # reads credentials from here
+#   smolvm machine exec --name proj -u user -it -- zsh -l
+#   open http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=scale       # the desktop
+#
+# The image's own CMD (`wrap-desktop run`) is the workload: it brings up Xvfb,
+# XFCE, Chrome (CDP), VNC and noVNC, and keeps the machine up.
+image = "ghcr.io/tobi/wrapvm:latest"
+cpus = 4
+memory = 8192
+
+user = "user"
+workdir = "/home/user/workspace"
+volumes = [".:/home/user/workspace"]   # the directory you create the machine from
+
+# First start only, as root: install the agents as `user` into the image's mise tree.
+init = [
+  "/opt/wrap/bin/wrap-entrypoint mise use --global --pin --yes --jobs 4 -- pi@latest github:can1357/oh-my-pi@latest codex@latest claude@latest",
+]
+
+[network]
+# A desktop browses: the public internet is open; this machine's LAN, the host's
+# loopback, cloud metadata and CGNAT (tailnets) are not. allow_private reopens a range.
+block_private = true
+
+# GitHub: the host sets the whole Authorization header, so git, gh and mise
+# authenticate with no guest config. git needs Basic (it rejects Bearer), so
+# the host's GH_TOKEN is "Basic " + base64("x-access-token:<token>"). The guest
+# only gets a placeholder in GH_TOKEN, which is enough for gh to act logged in.
+[[network.credentials]]
+name = "github"
+environment_variable = "GH_TOKEN"
+allowed_hosts = ["github.com", "api.github.com"]
+set_header = "authorization"
+
+# pi: the guest's ANTHROPIC_API_KEY is a placeholder; the host swaps in its own
+# ANTHROPIC_API_KEY on requests to api.anthropic.com only.
+[[network.credentials]]
+name = "anthropic"
+environment_variable = "ANTHROPIC_API_KEY"
+allowed_hosts = ["api.anthropic.com"]

@@ -1,10 +1,13 @@
-# wrap desktop: base image + a headless X desktop (Xvfb + XFCE), one persistent
-# Google Chrome on that desktop with CDP on localhost:9222 and every first-run/
-# setup prompt suppressed system-wide, and agent-browser preconfigured to attach
-# to that Chrome — so a human (via VNC) and the agent share the same browser.
+# wrapvm: the wrap base image + a headless X desktop (Xvfb + XFCE), one
+# persistent Google Chrome on that desktop with CDP on localhost:9222 and every
+# first-run/setup prompt suppressed system-wide, agent-browser preconfigured to
+# attach to that Chrome — so a human (via VNC) and the agent share the same
+# browser — and agent-desktop, which sees and drives the desktop's apps through
+# the AT-SPI accessibility tree. This file is the one definition of the VM:
+# CI publishes it as ghcr.io/tobi/wrapvm, and the Smolfile boots that image.
 #
-#   docker run -d ghcr.io/tobi/wrap:desktop              # desktop + chrome up
-#   docker run -it ghcr.io/tobi/wrap:desktop             # shell, desktop autostarts
+#   docker run -d ghcr.io/tobi/wrapvm                    # desktop + chrome up
+#   docker run -it ghcr.io/tobi/wrapvm                   # shell, desktop autostarts
 #   -e WRAP_DESKTOP_AUTOSTART=0                          # opt out of autostart
 #
 # VNC :5900 and noVNC :6080 listen on all guest interfaces so the VM/container
@@ -28,7 +31,13 @@ ENV DISPLAY=:1 \
     WRAP_DESKTOP_CDP_PORT=9222 \
     WRAP_DESKTOP_CDP_PUBLIC_PORT=9223 \
     XDG_SESSION_TYPE=x11 \
-    NO_AT_BRIDGE=1
+    AGENT_BROWSER_CONFIG=/home/user/workspace/agent-browser.json
+# No NO_AT_BRIDGE anywhere: set, it makes every GTK and Chromium process skip
+# the accessibility bridge, nothing registers on the AT-SPI bus, and
+# agent-desktop sees no application at all.
+# AGENT_BROWSER_CONFIG replaces agent-browser's config discovery with that one
+# file; wrap-desktop and login shells write its default when it is missing
+# (see wrap-agent-browser-config below).
 
 # ---------------------------------------------------------------------------
 # X + XFCE + VNC + Chrome runtime deps (Arch repos). XFCE is assembled from
@@ -44,6 +53,7 @@ RUN pacman -Syu --noconfirm --needed \
       alsa-lib gtk3 libcups libxss libxtst nss xdg-utils at-spi2-core \
       libxrandr libxcomposite libxdamage libxkbcommon libdrm mesa pango cairo \
       libxshmfence vulkan-icd-loader \
+      dconf gsettings-desktop-schemas ffmpeg \
  && dbus-uuidgen --ensure=/etc/machine-id \
  && rm -rf /var/cache/pacman/pkg/*
 
@@ -374,11 +384,147 @@ RUN cat > /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml <
   </property>
 </channel>
 EOF
+# No compositing: with it on, a whole-screen capture (agent-desktop screenshot
+# --screen 0) is refused as PLATFORM_NOT_SUPPORTED; window capture works either
+# way. The other xfwm4 settings keep their defaults.
+RUN cat > /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfwm4" version="1.0">
+  <property name="general" type="empty">
+    <property name="use_compositing" type="bool" value="false"/>
+  </property>
+</channel>
+EOF
 RUN for home in /root /home/user; do \
       install -d "$home/.config"; \
       cp -a /etc/skel/.config/xfce4 "$home/.config/"; \
     done \
  && chown -R "${WRAP_UID}:${WRAP_GID}" /home/user/.config
+
+# ---------------------------------------------------------------------------
+# agent-desktop: the desktop's apps through the AT-SPI accessibility tree
+# (snapshot, refs, click, type, windows, clipboard, screenshots). The release
+# binary needs nothing but libc, so it is installed directly, checksum-verified,
+# rather than through npm (whose new default skips the package's postinstall).
+# ---------------------------------------------------------------------------
+ARG AGENT_DESKTOP_VERSION=1.0.2
+RUN arch="$(uname -m)" \
+ && name="agent-desktop-v${AGENT_DESKTOP_VERSION}-${arch}-unknown-linux-gnu.tar.gz" \
+ && base="https://github.com/vercel-labs/agent-desktop/releases/download/v${AGENT_DESKTOP_VERSION}" \
+ && cd /tmp \
+ && curl -fsSLO "$base/$name" \
+ && curl -fsSL "$base/checksums.txt" | grep " $name\$" | sha256sum -c - \
+ && install -d /opt/agent-desktop \
+ && bsdtar -x -C /opt/agent-desktop -f "$name" \
+ && rm -f "$name" \
+ && chmod -R a+rX /opt/agent-desktop \
+ && ln -sf /opt/agent-desktop/agent-desktop /usr/local/bin/agent-desktop \
+ && agent-desktop version
+
+# GTK and Chromium only register on the AT-SPI bus when the session's a11y bus
+# says IsEnabled=true; Chromium exports no tree while it is false, whatever its
+# flags. gsettings' toolkit-accessibility does not reach the bus launcher, so
+# wrap-desktop sets the property itself, once the bus is up and again on every
+# supervision pass (a restarted launcher comes back false).
+RUN cat > /opt/wrap/bin/wrap-a11y <<'EOF'
+#!/bin/sh
+# Make the session's accessibility bus report IsEnabled=true (idempotent).
+# Calling org.a11y.Bus starts the bus launcher when it is not running yet.
+set -eu
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/wrap-desktop-$(id -u)/runtime}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+enabled="$(gdbus call --session -d org.a11y.Bus -o /org/a11y/bus \
+  -m org.freedesktop.DBus.Properties.Get org.a11y.Status IsEnabled 2>/dev/null || true)"
+case "$enabled" in *true*) exit 0 ;; esac
+gdbus call --session -d org.a11y.Bus -o /org/a11y/bus \
+  -m org.freedesktop.DBus.Properties.Set org.a11y.Status IsEnabled '<true>' >/dev/null
+EOF
+RUN chmod 0755 /opt/wrap/bin/wrap-a11y
+
+# dconf needs a profile, or gsettings writes nothing for a HOME that has no
+# database yet (a bot's home): `gsettings set` returns 0 and the next read
+# gives the old value.
+RUN install -d /etc/dconf/profile \
+ && printf 'user-db:user\n' > /etc/dconf/profile/user
+
+# A small GTK app for checking the accessibility path end to end: a text
+# field, Greet and Clear buttons, and a label that answers "Hello, <name>!".
+#   gtk-demo & agent-desktop find --app gtk-demo --role textfield
+RUN cat > /tmp/gtk-demo.c <<'EOF'
+#include <gtk/gtk.h>
+
+static GtkWidget *label, *entry;
+
+static void on_greet(GtkWidget *button, gpointer data) {
+  const char *text = gtk_entry_get_text(GTK_ENTRY(entry));
+  char *message = (text && *text) ? g_strdup_printf("Hello, %s!", text) : g_strdup("Nothing typed yet");
+  gtk_label_set_text(GTK_LABEL(label), message);
+  g_free(message);
+}
+
+static void on_clear(GtkWidget *button, gpointer data) {
+  gtk_entry_set_text(GTK_ENTRY(entry), "");
+  gtk_label_set_text(GTK_LABEL(label), "Cleared");
+}
+
+int main(int argc, char **argv) {
+  gtk_init(&argc, &argv);
+  GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+  gtk_window_set_title(GTK_WINDOW(window), "agent-desktop demo");
+  gtk_window_set_default_size(GTK_WINDOW(window), 560, 300);
+
+  GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
+  gtk_container_set_border_width(GTK_CONTAINER(box), 24);
+  label = gtk_label_new("Ready");
+  gtk_label_set_xalign(GTK_LABEL(label), 0.0);
+  entry = gtk_entry_new();
+  gtk_entry_set_placeholder_text(GTK_ENTRY(entry), "type a name here");
+
+  GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+  GtkWidget *greet = gtk_button_new_with_label("Greet");
+  GtkWidget *clear = gtk_button_new_with_label("Clear");
+  gtk_box_pack_start(GTK_BOX(row), greet, FALSE, FALSE, 0);
+  gtk_box_pack_start(GTK_BOX(row), clear, FALSE, FALSE, 0);
+  g_signal_connect(greet, "clicked", G_CALLBACK(on_greet), NULL);
+  g_signal_connect(clear, "clicked", G_CALLBACK(on_clear), NULL);
+  g_signal_connect(window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
+
+  gtk_box_pack_start(GTK_BOX(box), label, FALSE, FALSE, 0);
+  gtk_box_pack_start(GTK_BOX(box), entry, FALSE, FALSE, 0);
+  gtk_box_pack_start(GTK_BOX(box), row, FALSE, FALSE, 0);
+  gtk_container_add(GTK_CONTAINER(window), box);
+  gtk_widget_show_all(window);
+  gtk_main();
+  return 0;
+}
+EOF
+RUN cc -O2 -o /usr/local/bin/gtk-demo /tmp/gtk-demo.c $(pkg-config --cflags --libs gtk+-3.0) \
+ && rm /tmp/gtk-demo.c
+
+# agent-browser's config is AGENT_BROWSER_CONFIG, in the workspace, so a
+# person can change it per project. It is written once, when missing, from
+# /etc/wrap/agent-browser.json: headed, and attached to the desktop's running
+# Chrome by discovery. That file replaces ~/.agent-browser/config.json.
+RUN install -d /etc/wrap \
+ && cat > /etc/wrap/agent-browser.json <<'EOF'
+{
+  "headed": true,
+  "autoConnect": true
+}
+EOF
+RUN cat > /opt/wrap/bin/wrap-agent-browser-config <<'EOF'
+#!/bin/sh
+# Write the default agent-browser config at $AGENT_BROWSER_CONFIG when nothing
+# is there yet and its directory exists. Never overwrites.
+file="${AGENT_BROWSER_CONFIG:-}"
+[ -n "$file" ] && [ ! -e "$file" ] || exit 0
+dir="$(dirname "$file")"
+[ -d "$dir" ] && [ -w "$dir" ] || exit 0
+(set -C; cat /etc/wrap/agent-browser.json > "$file") 2>/dev/null || exit 0
+# Written by root (a sudo -i shell): it still belongs to the workspace's user.
+[ "$(id -u)" != 0 ] || chown "$(stat -c %u:%g "$dir")" "$file"
+EOF
+RUN chmod 0755 /opt/wrap/bin/wrap-agent-browser-config
 
 # ---------------------------------------------------------------------------
 # wrap-desktop: idempotent supervisor for Xvfb :1 + XFCE + Chrome (CDP) +
@@ -483,6 +629,9 @@ start() {
     spawn xfce startxfce4
     say "desktop up on $DISPLAY ($WRAP_DESKTOP_GEOMETRY)"
   fi
+  # Before Chrome starts: it reads IsEnabled at launch. Every pass re-asserts it.
+  /opt/wrap/bin/wrap-a11y >>"$log" 2>&1 || say "could not enable the accessibility bus (see $log)"
+  /opt/wrap/bin/wrap-agent-browser-config
   spawn x11vnc x11vnc -display "$DISPLAY" -forever -shared -nopw -noxdamage -xkb \
     -rfbport "$WRAP_DESKTOP_VNC_PORT" -quiet
   spawn novnc websockify --web /usr/share/novnc \
@@ -554,9 +703,11 @@ RUN cat > /etc/profile.d/wrap-desktop.sh <<'EOF'
 export DISPLAY="${DISPLAY:-:1}"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/wrap-desktop-$(id -u)/runtime}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+export AGENT_BROWSER_CONFIG="${AGENT_BROWSER_CONFIG:-/home/user/workspace/agent-browser.json}"
 if [ "${WRAP_DESKTOP_AUTOSTART:-1}" = 1 ] && [ -x /opt/wrap/bin/wrap-desktop ]; then
   /opt/wrap/bin/wrap-desktop start --quiet >/dev/null 2>&1 || true
 fi
+/opt/wrap/bin/wrap-agent-browser-config 2>/dev/null || true
 EOF
 
 # Short operator/agent note about what is wired up.
@@ -574,11 +725,18 @@ RUN cat > /etc/wrap/desktop.md <<'EOF'
   from ~/.config/chrome-flags.conf, else /etc/wrap/chrome-flags.conf. First-run, sign-in, sync, default-browser,
   privacy-sandbox, keyring and promo prompts are disabled via managed policies in
   /etc/opt/chrome/policies/managed and /opt/google/chrome/initial_preferences.
-- agent-browser is preconfigured (~/.agent-browser/config.json, `cdp: 9222`) to
-  attach to that Chrome: `agent-browser open https://example.com` acts in the
+- agent-browser reads $AGENT_BROWSER_CONFIG (/home/user/workspace/agent-browser.json,
+  written once when missing: `{"headed": true, "autoConnect": true}`), so it
+  attaches to that Chrome: `agent-browser open https://example.com` acts in the
   same browser a human sees over VNC and can take over (log in, solve a captcha,
-  hand back). A project-level ./agent-browser.json still overrides, e.g. drop
-  `cdp` to get an isolated headed Chrome instead. `agent-browser doctor` verifies.
+  hand back). Edit that file per workspace; it replaces ~/.agent-browser/config.json.
+  `agent-browser doctor` verifies.
+- agent-desktop drives the desktop's apps through the AT-SPI tree: start with
+  `agent-desktop status` and `agent-desktop skills get desktop`. The a11y bus
+  reports IsEnabled=true (`wrap-a11y` re-asserts it) and NO_AT_BRIDGE is unset,
+  so GTK apps and Chrome register. `gtk-demo` is a small GTK app to try it on.
+  xfwm4 runs without compositing, so whole-screen capture works.
+- ffmpeg is installed (e.g. record :1 with `ffmpeg -f x11grab -i :1 out.mp4`).
   Pages' WebMCP tools: `agent-browser webmcp list` / `webmcp invoke <tool>`.
 - View: VNC :5900 (no password) or noVNC http://<host>:6080/vnc.html through the
   VM's published ports (wrap: `network.ports: [6080]`; the host side is loopback).

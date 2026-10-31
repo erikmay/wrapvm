@@ -1,0 +1,38 @@
+#!/bin/sh
+# wrap's workflow on smolvm, using the Smolfile next to this script.
+#   wrapvm            login zsh in this directory's machine
+#   wrapvm -- CMD...  run CMD there
+# The desktop (noVNC) is published on the host's loopback at $WRAPVM_DESKTOP_PORT
+# (default 6080), chosen when the machine is created.
+# SMOLVM (default smolvm) names the smolvm CLI; WRAPVM_IMAGE overrides the
+# Smolfile's image when the machine is created (a registry ref or ./image.tar).
+set -eu
+here=$(dirname "$(readlink -f "$0")")
+smolvm="${SMOLVM:-smolvm}"
+port="${WRAPVM_DESKTOP_PORT:-6080}"
+dir=$(pwd -P)
+base=$(basename "$dir" | tr -cs 'A-Za-z0-9' '-' | cut -c1-40 | sed 's/^-*//; s/-*$//')
+name="${base:-wrapvm}-$(printf %s "$dir" | cksum | cut -c1-6)"
+
+# One machine per directory; it mounts the directory it was created from.
+if ! "$smolvm" machine status --name "$name" >/dev/null 2>&1; then
+  ( # a subshell, so the caller's arguments survive
+    set -- machine create --name "$name" -s "$here/Smolfile" -p "$port:6080"
+    [ -z "${WRAPVM_IMAGE:-}" ] || set -- "$@" --image "$WRAPVM_IMAGE"
+    exec "$smolvm" "$@" >/dev/null
+  )
+fi
+
+# Credentials are read from this environment when the machine starts
+# (a no-op when it is already running): GitHub from gh, pi's ANTHROPIC_API_KEY as is.
+if token=$(gh auth token 2>/dev/null) && [ -n "$token" ]; then
+  GH_TOKEN="Basic $(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')"
+  export GH_TOKEN
+fi
+"$smolvm" machine start --name "$name" >&2
+echo "desktop: http://127.0.0.1:$port/vnc.html?autoconnect=1&resize=scale&reconnect=1" >&2
+
+[ "${1:-}" = "--" ] && shift
+[ $# -gt 0 ] || set -- zsh -l
+t=; [ -t 0 ] && [ -t 1 ] && t=-t
+exec "$smolvm" machine exec --name "$name" -u user -i $t -- "$@"
