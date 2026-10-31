@@ -1,0 +1,594 @@
+# wrap desktop: base image + a headless X desktop (Xvfb + XFCE), one persistent
+# Google Chrome on that desktop with CDP on localhost:9222 and every first-run/
+# setup prompt suppressed system-wide, and agent-browser preconfigured to attach
+# to that Chrome — so a human (via VNC) and the agent share the same browser.
+#
+#   docker run -d ghcr.io/tobi/wrap:desktop              # desktop + chrome up
+#   docker run -it ghcr.io/tobi/wrap:desktop             # shell, desktop autostarts
+#   -e WRAP_DESKTOP_AUTOSTART=0                          # opt out of autostart
+#
+# VNC :5900 and noVNC :6080 listen on all guest interfaces so the VM/container
+# port publish (which targets the guest NIC, not its loopback) can reach them;
+# the host side of that publish is loopback-only. Chrome only binds CDP to
+# 127.0.0.1:9222 (it ignores --remote-debugging-address with a window), so a
+# socat forwarder serves it on all guest interfaces at :9223.
+ARG BASE_IMAGE=ghcr.io/tobi/wrap:latest
+FROM ${BASE_IMAGE}
+
+# Build steps run as root; keep root's droppings out of the user's home. The
+# runtime identity (HOME=/home/user) is restored at the end of the file.
+ENV HOME=/root USER=root
+
+# One shared X display for everything. agent-browser sees DISPLAY set and puts
+# Chrome on the XFCE desktop instead of spawning a private Xvfb.
+ENV DISPLAY=:1 \
+    WRAP_DESKTOP_GEOMETRY=1280x800x24 \
+    WRAP_DESKTOP_VNC_PORT=5900 \
+    WRAP_DESKTOP_NOVNC_PORT=6080 \
+    WRAP_DESKTOP_CDP_PORT=9222 \
+    WRAP_DESKTOP_CDP_PUBLIC_PORT=9223 \
+    XDG_SESSION_TYPE=x11 \
+    NO_AT_BRIDGE=1
+
+# ---------------------------------------------------------------------------
+# X + XFCE + VNC + Chrome runtime deps (Arch repos). XFCE is assembled from
+# components rather than the `xfce4` group to skip power-manager, screensaver,
+# pulseaudio plugin and friends — nothing here should ever lock or dim :1.
+# ---------------------------------------------------------------------------
+RUN pacman -Syu --noconfirm --needed \
+      xorg-server-xvfb xorg-xauth xorg-xdpyinfo xorg-xset xorg-xrandr xdotool \
+      x11vnc scrot socat \
+      dbus xfce4-session xfwm4 xfdesktop xfce4-panel xfce4-settings xfconf \
+      xfce4-terminal thunar xfce4-appfinder garcon adwaita-icon-theme \
+      ttf-dejavu ttf-liberation noto-fonts noto-fonts-emoji \
+      alsa-lib gtk3 libcups libxss libxtst nss xdg-utils at-spi2-core \
+      libxrandr libxcomposite libxdamage libxkbcommon libdrm mesa pango cairo \
+      libxshmfence vulkan-icd-loader \
+ && dbus-uuidgen --ensure=/etc/machine-id \
+ && rm -rf /var/cache/pacman/pkg/*
+
+# agent-browser installs on demand through mise's native registry backend,
+# without npm/Node or a custom launcher.
+COPY --chown=${WRAP_UID}:${WRAP_GID} resources/mise-desktop.toml /opt/mise/config/conf.d/desktop.toml
+RUN sudo -u "${WRAP_USER_NAME}" -H sh -lc 'mise reshim'
+
+# websockify bridges noVNC to x11vnc on every desktop start, so it is baked in.
+# It is AUR-only on Arch: a venv on the system python, which costs ~1MB where
+# mise's own python + uv cost ~240MB. --no-deps skips numpy (it only speeds up
+# unmasking the small client-to-server frames) and the token-plugin libraries.
+RUN /usr/bin/python -m venv /opt/websockify \
+ && /opt/websockify/bin/pip install --no-cache-dir --no-deps --quiet websockify \
+ && /opt/websockify/bin/pip uninstall --yes --quiet pip \
+ && ln -sf /opt/websockify/bin/websockify /usr/local/bin/websockify \
+ && chmod -R a+rX /opt/websockify
+
+# noVNC is static files, not a CLI; keep its versioned distribution in the image.
+ARG NOVNC_VERSION=1.6.0
+RUN curl -fsSL "https://github.com/novnc/noVNC/archive/refs/tags/v${NOVNC_VERSION}.tar.gz" \
+      | bsdtar -x -C /tmp \
+ && install -d /usr/share \
+ && mv "/tmp/noVNC-${NOVNC_VERSION}" /usr/share/novnc \
+ && rm -rf /usr/share/novnc/tests /usr/share/novnc/docs /usr/share/novnc/snap \
+ && ln -sf vnc.html /usr/share/novnc/index.html \
+ && chmod -R a+rX /usr/share/novnc
+
+# ---------------------------------------------------------------------------
+# Google Chrome stable, straight from Google's .deb (the AUR package does the
+# same thing). No dpkg needed: bsdtar unpacks data.tar.* onto /. Cron/apt
+# repo hooks from the package are dropped.
+# ---------------------------------------------------------------------------
+RUN curl -fsSL -o /tmp/chrome.deb \
+      https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+ && bsdtar -xOf /tmp/chrome.deb 'data.tar.*' | bsdtar -x -C / \
+ && rm -f /tmp/chrome.deb /etc/cron.daily/google-chrome \
+ && rm -rf /opt/google/chrome/cron \
+ && ln -sf /opt/google/chrome/google-chrome /usr/bin/google-chrome-stable \
+ && ln -sf /opt/google/chrome/google-chrome /usr/bin/google-chrome \
+ && chmod 4755 /opt/google/chrome/chrome-sandbox \
+ && for s in 16 24 32 48 64 128 256; do \
+      install -D -m 0644 "/opt/google/chrome/product_logo_$s.png" \
+        "/usr/share/icons/hicolor/${s}x${s}/apps/google-chrome.png"; \
+    done \
+ && gtk-update-icon-cache -f -t /usr/share/icons/hicolor \
+ && /opt/google/chrome/google-chrome --version
+# (The .deb's postinst, which we skip, is what normally installs those icons;
+#  the hicolor cache must be rebuilt or GTK trusts the stale one and shows "?".)
+
+# ---------------------------------------------------------------------------
+# Speedrun Chrome's setup. Two layers, both system-wide:
+#
+#  1. Managed policies (/etc/opt/chrome/policies/managed): authoritative, apply
+#     to every profile including the fresh user-data-dirs agent-browser makes.
+#     Kill sign-in, sync, default-browser nag, privacy-sandbox dialog, promos,
+#     password/autofill bubbles, notifications/geolocation prompts, metrics,
+#     field-trial surprises. Remote debugging stays allowed (agent-browser/CDP).
+#  2. initial_preferences (formerly master_preferences): consumed once on
+#     profile creation — no welcome/first-run UI, no import wizard, new-tab
+#     page on startup, bookmarks bar hidden.
+# ---------------------------------------------------------------------------
+RUN install -d /etc/opt/chrome/policies/managed /etc/opt/chrome/policies/recommended \
+ && cat > /etc/opt/chrome/policies/managed/00-wrap.json <<'EOF'
+{
+  "BrowserSignin": 0,
+  "SyncDisabled": true,
+  "BrowserAddPersonEnabled": false,
+  "BrowserGuestModeEnabled": false,
+  "DefaultBrowserSettingEnabled": false,
+  "PromotionalTabsEnabled": false,
+  "PrivacySandboxPromptEnabled": false,
+  "PrivacySandboxAdMeasurementEnabled": false,
+  "PrivacySandboxAdTopicsEnabled": false,
+  "PrivacySandboxSiteEnabledAdsEnabled": false,
+  "MetricsReportingEnabled": false,
+  "UrlKeyedAnonymizedDataCollectionEnabled": false,
+  "CloudReportingEnabled": false,
+  "ChromeVariations": 2,
+  "PasswordManagerEnabled": false,
+  "PasswordLeakDetectionEnabled": false,
+  "AutofillAddressEnabled": false,
+  "AutofillCreditCardEnabled": false,
+  "PaymentMethodQueryEnabled": false,
+  "TranslateEnabled": false,
+  "SpellCheckServiceEnabled": false,
+  "SearchSuggestEnabled": false,
+  "AlternateErrorPagesEnabled": false,
+  "BackgroundModeEnabled": false,
+  "HighEfficiencyModeEnabled": false,
+  "BatterySaverModeAvailability": 0,
+  "RestoreOnStartup": 5,
+  "HomepageIsNewTabPage": true,
+  "ShowHomeButton": false,
+  "BookmarkBarEnabled": false,
+  "NTPCardsVisible": false,
+  "NTPMiddleSlotAnnouncementVisible": false,
+  "ShoppingListEnabled": false,
+  "SideSearchEnabled": false,
+  "DefaultNotificationsSetting": 2,
+  "DefaultGeolocationSetting": 2,
+  "DefaultSensorsSetting": 2,
+  "DefaultWebBluetoothGuardSetting": 2,
+  "DefaultWebUsbGuardSetting": 2,
+  "AudioCaptureAllowed": false,
+  "VideoCaptureAllowed": false,
+  "DeveloperToolsAvailability": 1,
+  "RemoteDebuggingAllowed": true
+}
+EOF
+RUN cat > /opt/google/chrome/initial_preferences <<'EOF'
+{
+  "homepage_is_newtabpage": true,
+  "browser": {
+    "show_home_button": false,
+    "check_default_browser": false,
+    "has_seen_welcome_page": true
+  },
+  "session": { "restore_on_startup": 5 },
+  "bookmark_bar": { "show_on_all_tabs": false },
+  "first_run_tabs": [],
+  "sync_promo": { "show_on_first_run_allowed": false, "user_skipped": true },
+  "distribution": {
+    "skip_first_run_ui": true,
+    "suppress_first_run_bubble": true,
+    "suppress_first_run_default_browser_prompt": true,
+    "make_chrome_default": false,
+    "make_chrome_default_for_user": false,
+    "import_bookmarks": false,
+    "import_history": false,
+    "import_home_page": false,
+    "import_search_engine": false,
+    "do_not_create_desktop_shortcut": true,
+    "do_not_create_quick_launch_shortcut": true,
+    "do_not_create_taskbar_shortcut": true,
+    "do_not_launch_chrome": true,
+    "do_not_register_for_update_launch": true,
+    "verbose_logging": false
+  }
+}
+EOF
+
+# Launcher that every consumer goes through (PATH puts /usr/local/bin first,
+# so it shadows the deb's /usr/bin symlink for the .desktop entry too).
+#  - container-safe flags: no /dev/shm reliance, no first-run, no default check
+#  - root gets --no-sandbox (Chrome refuses to start as uid 0 otherwise).
+#  - user flags, one per line, from ~/.config/chrome-flags.conf (Arch's
+#    google-chrome convention), else /etc/wrap/chrome-flags.conf. They apply to
+#    every launch: the shared desktop Chrome, the dock, and any Chrome that
+#    agent-browser starts itself.
+RUN cat > /usr/local/bin/google-chrome-stable <<'EOF'
+#!/bin/sh
+n=$#
+conf="${XDG_CONFIG_HOME:-$HOME/.config}/chrome-flags.conf"
+[ -r "$conf" ] || conf=/etc/wrap/chrome-flags.conf
+if [ -r "$conf" ]; then
+  while read -r flag || [ -n "$flag" ]; do
+    case "$flag" in ''|'#'*) ;; *) set -- "$@" "$flag" ;; esac
+  done < "$conf"
+fi
+# Rotate the caller's arguments (URLs) back behind the configured flags.
+while [ "$n" -gt 0 ]; do a=$1; shift; set -- "$@" "$a"; n=$((n - 1)); done
+# --password-store=basic: never trigger a keyring unlock dialog.
+set -- --disable-dev-shm-usage --no-first-run --no-default-browser-check \
+       --password-store=basic "$@"
+if [ "$(id -u)" = 0 ]; then
+  set -- --no-sandbox "$@"
+fi
+exec /opt/google/chrome/google-chrome "$@"
+EOF
+# Chrome's sandbox needs unprivileged user+pid+net namespaces, which Docker's
+# default seccomp profile refuses (Chrome then aborts: zygote "Failed to move to
+# new namespace"), so the default drops it. Remove --no-sandbox under a runtime
+# that allows them (microVMs, `--security-opt seccomp=unconfined`).
+# Chrome honors only the last --enable-features: keep both WebMCP features in
+# any replacement line, or agent-browser's `webmcp` commands find no tools.
+RUN cat > /etc/wrap/chrome-flags.conf <<'EOF'
+# Extra Google Chrome flags, one per line. Copy to ~/.config/chrome-flags.conf
+# to change them; restart Chrome with `wrap-desktop stop && wrap-desktop start`.
+--no-sandbox
+# WebMCP: pages register tools on document.modelContext; agent-browser lists
+# and calls them with `agent-browser webmcp list|invoke`.
+--enable-features=WebMCPTesting,DevToolsWebMCPSupport
+EOF
+RUN chmod 0755 /usr/local/bin/google-chrome-stable \
+ && ln -sf google-chrome-stable /usr/local/bin/google-chrome \
+ && ln -sf google-chrome-stable /usr/local/bin/chrome
+
+# wrap-chrome: open in the *shared* desktop Chrome (the CDP instance) rather
+# than a second profile. Chrome hands the URL to the running instance when the
+# profile dir matches. Used by wrap-desktop and by the dock launcher.
+RUN cat > /usr/local/bin/wrap-chrome <<'EOF'
+#!/bin/sh
+: "${WRAP_DESKTOP_CHROME_PROFILE:=$HOME/.config/wrap-chrome}"
+: "${WRAP_DESKTOP_CDP_PORT:=9222}"
+exec google-chrome-stable --user-data-dir="$WRAP_DESKTOP_CHROME_PROFILE" \
+  --remote-debugging-port="$WRAP_DESKTOP_CDP_PORT" --remote-debugging-address=127.0.0.1 "$@"
+EOF
+RUN chmod 0755 /usr/local/bin/wrap-chrome \
+ && cat > /usr/share/applications/wrap-chrome.desktop <<'EOF'
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Google Chrome
+Comment=Shared desktop browser (CDP on localhost:9222)
+Exec=wrap-chrome %U
+Icon=google-chrome
+Terminal=false
+Categories=Network;WebBrowser;
+StartupWMClass=Google-chrome
+EOF
+
+# agent-browser defaults: user-level config (~/.agent-browser/config.json) so
+# a project-level ./agent-browser.json can still layer on top. Seeded into
+# /etc/skel for future users and copied to the two accounts that exist.
+#  - cdp: attach to the persistent desktop Chrome that wrap-desktop runs with
+#    --remote-debugging-port on localhost. Agent and human share one browser.
+#  - executablePath/headed: only used if something overrides cdp (e.g. a
+#    project config wanting an isolated browser) — still real Chrome, on :1.
+#  - idleTimeout 0: the daemon never tears the visible browser down.
+RUN install -d /etc/skel/.agent-browser /etc/wrap \
+ && cat > /etc/skel/.agent-browser/config.json <<'EOF'
+{
+  "$schema": "https://agent-browser.dev/schema.json",
+  "cdp": "9222",
+  "executablePath": "/usr/local/bin/google-chrome-stable",
+  "headed": true,
+  "idleTimeout": "0",
+  "screenshotDir": "/tmp/agent-browser-screenshots"
+}
+EOF
+RUN for home in /root /home/user; do \
+      install -d "$home/.agent-browser"; \
+      cp /etc/skel/.agent-browser/config.json "$home/.agent-browser/config.json"; \
+    done \
+ && chown -R "${WRAP_UID}:${WRAP_GID}" /home/user/.agent-browser
+
+# XFCE look: no top bar, one centered bottom dock with three launchers
+# (Chrome / Thunar / Terminal) on a transparent panel, solid navy backdrop,
+# no desktop icons or right-click menu, nothing that can lock or prompt.
+# Seeded into /etc/skel and both existing homes so the first start is final.
+RUN install -d /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml \
+      /etc/skel/.config/xfce4/panel/launcher-1 \
+      /etc/skel/.config/xfce4/panel/launcher-2 \
+      /etc/skel/.config/xfce4/panel/launcher-3 \
+ && cp /usr/share/applications/wrap-chrome.desktop     /etc/skel/.config/xfce4/panel/launcher-1/ \
+ && cp /usr/share/applications/thunar.desktop          /etc/skel/.config/xfce4/panel/launcher-2/ \
+ && cp /usr/share/applications/xfce4-terminal.desktop  /etc/skel/.config/xfce4/panel/launcher-3/ \
+ && cat > /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfce4-panel" version="1.0">
+  <property name="configver" type="int" value="2"/>
+  <property name="panels" type="array">
+    <value type="int" value="1"/>
+    <property name="dark-mode" type="bool" value="true"/>
+    <property name="panel-1" type="empty">
+      <property name="position" type="string" value="p=10;x=0;y=0"/>
+      <property name="position-locked" type="bool" value="true"/>
+      <property name="length" type="uint" value="1"/>
+      <property name="size" type="uint" value="64"/>
+      <property name="icon-size" type="uint" value="48"/>
+      <property name="autohide-behavior" type="uint" value="0"/>
+      <property name="background-style" type="uint" value="1"/>
+      <property name="background-rgba" type="array">
+        <value type="double" value="0"/>
+        <value type="double" value="0"/>
+        <value type="double" value="0"/>
+        <value type="double" value="0"/>
+      </property>
+      <property name="plugin-ids" type="array">
+        <value type="int" value="1"/>
+        <value type="int" value="2"/>
+        <value type="int" value="3"/>
+      </property>
+    </property>
+  </property>
+  <property name="plugins" type="empty">
+    <property name="plugin-1" type="string" value="launcher">
+      <property name="items" type="array"><value type="string" value="wrap-chrome.desktop"/></property>
+    </property>
+    <property name="plugin-2" type="string" value="launcher">
+      <property name="items" type="array"><value type="string" value="thunar.desktop"/></property>
+    </property>
+    <property name="plugin-3" type="string" value="launcher">
+      <property name="items" type="array"><value type="string" value="xfce4-terminal.desktop"/></property>
+    </property>
+  </property>
+</channel>
+EOF
+RUN cat > /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-session.xml <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfce4-session" version="1.0">
+  <property name="general" type="empty">
+    <property name="LockCommand" type="string" value=""/>
+    <property name="SaveOnExit" type="bool" value="false"/>
+    <property name="PromptOnLogout" type="bool" value="false"/>
+  </property>
+  <property name="shutdown" type="empty">
+    <property name="LockScreen" type="bool" value="false"/>
+  </property>
+</channel>
+EOF
+# Xvfb's RANDR output is named "screen", hence monitorscreen.
+RUN cat > /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfce4-desktop" version="1.0">
+  <property name="backdrop" type="empty">
+    <property name="screen0" type="empty">
+      <property name="monitorscreen" type="empty">
+        <property name="workspace0" type="empty">
+          <property name="image-style" type="int" value="0"/>
+          <property name="color-style" type="int" value="0"/>
+          <property name="rgba1" type="array">
+            <value type="double" value="0.11"/>
+            <value type="double" value="0.14"/>
+            <value type="double" value="0.21"/>
+            <value type="double" value="1"/>
+          </property>
+        </property>
+      </property>
+    </property>
+  </property>
+  <property name="desktop-icons" type="empty">
+    <property name="style" type="int" value="0"/>
+  </property>
+  <property name="desktop-menu" type="empty">
+    <property name="show" type="bool" value="false"/>
+  </property>
+</channel>
+EOF
+RUN for home in /root /home/user; do \
+      install -d "$home/.config"; \
+      cp -a /etc/skel/.config/xfce4 "$home/.config/"; \
+    done \
+ && chown -R "${WRAP_UID}:${WRAP_GID}" /home/user/.config
+
+# ---------------------------------------------------------------------------
+# wrap-desktop: idempotent supervisor for Xvfb :1 + XFCE + Chrome (CDP) +
+# x11vnc + noVNC. Runs as whoever calls it (normally `user`). Xvfb is started
+# with -ac so any uid in the VM (sudo, root plumbing) can also draw on :1.
+# Each `start` re-spawns whichever piece has died, so a crashed Chrome comes
+# back on the next login shell; `run` also does that every
+# WRAP_DESKTOP_SUPERVISE_SECONDS (default 30, 0 disables) and stops cleanly on
+# SIGTERM, so a failed piece never takes the container down with it.
+#
+#   wrap-desktop start [--quiet]   bring the desktop up if :1 is not live
+#   wrap-desktop status            exit 0 when :1 answers
+#   wrap-desktop stop              tear down what this uid started
+#   wrap-desktop run               start, supervise, block (container CMD)
+#   wrap-desktop url               print the noVNC URL
+# ---------------------------------------------------------------------------
+RUN cat > /opt/wrap/bin/wrap-desktop <<'EOF'
+#!/bin/sh
+set -eu
+
+: "${DISPLAY:=:1}"
+: "${WRAP_DESKTOP_GEOMETRY:=1280x800x24}"
+: "${WRAP_DESKTOP_VNC_PORT:=5900}"
+: "${WRAP_DESKTOP_NOVNC_PORT:=6080}"
+: "${WRAP_DESKTOP_CDP_PORT:=9222}"
+: "${WRAP_DESKTOP_CDP_PUBLIC_PORT=9223}"
+: "${WRAP_DESKTOP_CHROME_PROFILE:=$HOME/.config/wrap-chrome}"
+: "${WRAP_DESKTOP_SUPERVISE_SECONDS:=30}"
+export DISPLAY
+
+dpy_num="${DISPLAY#:}"; dpy_num="${dpy_num%%.*}"
+run_dir="/tmp/wrap-desktop-$(id -u)"
+log="$run_dir/desktop.log"
+# Private session bus + runtime dir. dbus-launch's X11 autolaunch is compiled
+# out on Arch, so without this xfce4-session starts but never spawns xfwm4,
+# the panel or xfdesktop (xfconf needs the bus). Same values are exported to
+# login shells by /etc/profile.d/wrap-desktop.sh so later GUI launches join it.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-$run_dir/runtime}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+quiet=0
+
+say() { [ "$quiet" = 1 ] || printf '%s\n' "$*" >&2; }
+
+display_up() { xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; }
+bus_up() { dbus-send --session --dest=org.freedesktop.DBus --type=method_call \
+  /org/freedesktop/DBus org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1; }
+
+# Chrome trusts NSS (~/.pki/nssdb), not the system CA store. Import every local
+# CA anchor so TLS-intercepting sandboxes (microsandbox secret injection puts
+# its CA at /.msb/tls/ca.pem and in the Arch anchors dir) work in the browser
+# exactly like they already do for curl/mise.
+trust_local_cas() {
+  command -v certutil >/dev/null 2>&1 || return 0
+  db="$HOME/.pki/nssdb"
+  install -d -m 0700 "$db"
+  [ -f "$db/cert9.db" ] || certutil -d "sql:$db" -N --empty-password >>"$log" 2>&1
+  for ca in /.msb/tls/ca.pem /etc/ca-certificates/trust-source/anchors/*; do
+    [ -r "$ca" ] || continue
+    nick="local-ca-$(basename "$ca" | sed 's/\.[^.]*$//')"
+    certutil -d "sql:$db" -L -n "$nick" >/dev/null 2>&1 && continue
+    certutil -d "sql:$db" -A -t "C,," -n "$nick" -i "$ca" >>"$log" 2>&1 \
+      && say "chrome trusts $ca"
+  done
+}
+cdp_up() { curl -fsS -m 1 "http://127.0.0.1:$WRAP_DESKTOP_CDP_PORT/json/version" >/dev/null 2>&1; }
+
+spawn() { # name cmd...
+  name="$1"; shift
+  if [ -f "$run_dir/$name.pid" ] && kill -0 "$(cat "$run_dir/$name.pid")" 2>/dev/null; then
+    return 0
+  fi
+  setsid "$@" >>"$log" 2>&1 </dev/null &
+  echo $! >"$run_dir/$name.pid"
+}
+
+start() {
+  install -d -m 0700 "$run_dir" "$XDG_RUNTIME_DIR"
+  if ! bus_up; then
+    rm -f "$run_dir/dbus.pid" "${DBUS_SESSION_BUS_ADDRESS#unix:path=}"
+    spawn dbus dbus-daemon --session --nofork --nopidfile --address="$DBUS_SESSION_BUS_ADDRESS"
+    i=0
+    until bus_up; do
+      i=$((i + 1)); [ "$i" -lt 50 ] || { say "session bus did not come up (see $log)"; return 1; }
+      sleep 0.1
+    done
+  fi
+  trust_local_cas
+  if display_up; then
+    say "desktop already up on $DISPLAY"
+  else
+    rm -f "/tmp/.X${dpy_num}-lock" "/tmp/.X11-unix/X${dpy_num}"
+    spawn xvfb Xvfb "$DISPLAY" -screen 0 "$WRAP_DESKTOP_GEOMETRY" -ac -nolisten tcp \
+      +extension GLX +extension RANDR +render -noreset
+    i=0
+    until display_up; do
+      i=$((i + 1)); [ "$i" -lt 100 ] || { say "Xvfb did not come up (see $log)"; return 1; }
+      sleep 0.1
+    done
+    xset -display "$DISPLAY" s off -dpms >/dev/null 2>&1 || true
+    # startxfce4 with DISPLAY and DBUS_SESSION_BUS_ADDRESS set runs xinitrc
+    # directly (xfwm4, xfdesktop, panel) instead of launching its own X/dbus.
+    spawn xfce startxfce4
+    say "desktop up on $DISPLAY ($WRAP_DESKTOP_GEOMETRY)"
+  fi
+  spawn x11vnc x11vnc -display "$DISPLAY" -forever -shared -nopw -noxdamage -xkb \
+    -rfbport "$WRAP_DESKTOP_VNC_PORT" -quiet
+  spawn novnc websockify --web /usr/share/novnc \
+    "0.0.0.0:$WRAP_DESKTOP_NOVNC_PORT" "127.0.0.1:$WRAP_DESKTOP_VNC_PORT"
+  # The one shared Chrome. Explicit --user-data-dir is mandatory: Chrome >= 136
+  # refuses --remote-debugging-port on the default profile directory.
+  if ! cdp_up; then
+    rm -f "$run_dir/chrome.pid"
+    install -d "$WRAP_DESKTOP_CHROME_PROFILE"
+    # --no-startup-window: the browser process (and CDP) is up, but the
+    # desktop stays clean until agent-browser or the dock opens a window.
+    spawn chrome wrap-chrome --no-startup-window
+    i=0
+    until cdp_up; do
+      i=$((i + 1)); [ "$i" -lt 150 ] || { say "chrome CDP did not come up (see $log)"; return 1; }
+      sleep 0.1
+    done
+  fi
+  # CDP for DevTools/automation outside the guest. Empty or 0 disables it.
+  if [ -n "$WRAP_DESKTOP_CDP_PUBLIC_PORT" ] && [ "$WRAP_DESKTOP_CDP_PUBLIC_PORT" != 0 ]; then
+    spawn cdp-public socat "TCP-LISTEN:$WRAP_DESKTOP_CDP_PUBLIC_PORT,bind=0.0.0.0,reuseaddr,fork" \
+      "TCP:127.0.0.1:$WRAP_DESKTOP_CDP_PORT"
+  fi
+  say "vnc  :$WRAP_DESKTOP_VNC_PORT   novnc http://127.0.0.1:$WRAP_DESKTOP_NOVNC_PORT/vnc.html (via port publish)"
+  say "cdp  http://127.0.0.1:$WRAP_DESKTOP_CDP_PORT  (agent-browser attaches here; :$WRAP_DESKTOP_CDP_PUBLIC_PORT on guest interfaces)"
+}
+
+stop() {
+  for f in "$run_dir"/*.pid; do
+    [ -f "$f" ] || continue
+    pid="$(cat "$f")"
+    kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+    rm -f "$f"
+  done
+}
+
+cmd="${1:-start}"; [ $# -gt 0 ] && shift
+for a in "$@"; do [ "$a" = "--quiet" ] && quiet=1; done
+case "$cmd" in
+  start)  start ;;
+  stop)   stop ;;
+  status) if display_up; then say "up on $DISPLAY"; else say "down"; exit 1; fi ;;
+  url)    printf 'http://127.0.0.1:%s/vnc.html\n' "$WRAP_DESKTOP_NOVNC_PORT" ;;
+  run)
+    # Sleep in the background and `wait`: a foreground sleep defers the TERM
+    # trap until it returns, so `docker stop` would always hit its kill timeout.
+    trap 'stop; exit 0' INT TERM
+    start || say "desktop start incomplete (see $log); retrying"
+    while :; do
+      if [ "$WRAP_DESKTOP_SUPERVISE_SECONDS" -gt 0 ] 2>/dev/null; then
+        sleep "$WRAP_DESKTOP_SUPERVISE_SECONDS" & wait $! || true
+        quiet=1; start || true
+      else
+        sleep 3600 & wait $! || true
+      fi
+    done ;;
+  # Whole-desktop capture (what a human would see over VNC), for agents that
+  # want more than agent-browser's page screenshot.
+  screenshot) out="${1:-/tmp/wrap-desktop-$(date +%s).png}"; scrot -o "$out" && printf '%s\n' "$out" ;;
+  *) echo "usage: wrap-desktop start [--quiet] | stop | status | run | url | screenshot [FILE]" >&2; exit 2 ;;
+esac
+EOF
+RUN chmod 0755 /opt/wrap/bin/wrap-desktop
+
+# Autostart from login shells (wrap enters every session via `zsh -l`; docker
+# `-it` shells too). /etc/profile sources profile.d for sh/bash, and Arch's
+# /etc/zsh/zprofile sources /etc/profile. Idempotent: ~1s once, instant after.
+RUN cat > /etc/profile.d/wrap-desktop.sh <<'EOF'
+export DISPLAY="${DISPLAY:-:1}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/wrap-desktop-$(id -u)/runtime}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+if [ "${WRAP_DESKTOP_AUTOSTART:-1}" = 1 ] && [ -x /opt/wrap/bin/wrap-desktop ]; then
+  /opt/wrap/bin/wrap-desktop start --quiet >/dev/null 2>&1 || true
+fi
+EOF
+
+# Short operator/agent note about what is wired up.
+RUN cat > /etc/wrap/desktop.md <<'EOF'
+# wrap desktop
+
+- X display `:1` (Xvfb, 1280x800) running XFCE. Autostarts from login shells;
+  `wrap-desktop start|stop|status|url|screenshot [FILE]` (screenshot = whole desktop).
+- Local CA anchors (e.g. a TLS-intercepting sandbox's CA) are imported into
+  Chrome's NSS store at start, so intercepted hosts load without cert errors.
+- One persistent Google Chrome on that desktop (no window until something opens
+  one; the dock's Chrome icon opens a window in the same instance), CDP on
+  127.0.0.1:9222 (and :9223 on guest interfaces for publishing), profile in
+  ~/.config/wrap-chrome. Launch flags (default --no-sandbox and WebMCP) come
+  from ~/.config/chrome-flags.conf, else /etc/wrap/chrome-flags.conf. First-run, sign-in, sync, default-browser,
+  privacy-sandbox, keyring and promo prompts are disabled via managed policies in
+  /etc/opt/chrome/policies/managed and /opt/google/chrome/initial_preferences.
+- agent-browser is preconfigured (~/.agent-browser/config.json, `cdp: 9222`) to
+  attach to that Chrome: `agent-browser open https://example.com` acts in the
+  same browser a human sees over VNC and can take over (log in, solve a captcha,
+  hand back). A project-level ./agent-browser.json still overrides, e.g. drop
+  `cdp` to get an isolated headed Chrome instead. `agent-browser doctor` verifies.
+  Pages' WebMCP tools: `agent-browser webmcp list` / `webmcp invoke <tool>`.
+- View: VNC :5900 (no password) or noVNC http://<host>:6080/vnc.html through the
+  VM's published ports (wrap: `network.ports: [6080]`; the host side is loopback).
+EOF
+
+# Anything a root build step may have left in the user's home belongs to user.
+# Only touch mis-owned paths: chown -R rewrites every file into a new layer.
+RUN find "${WRAP_USER_HOME}" \( ! -uid "${WRAP_UID}" -o ! -gid "${WRAP_GID}" \) \
+      -exec chown -h "${WRAP_UID}:${WRAP_GID}" {} +
+
+ENV HOME=/home/user USER=user
+EXPOSE 5900 6080 9223
+CMD ["/opt/wrap/bin/wrap-desktop", "run"]

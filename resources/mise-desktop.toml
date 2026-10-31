@@ -1,0 +1,3 @@
+[tools]
+# The native registry backend needs neither npm nor a Node bootstrap.
+agent-browser = { version = "latest", lazy = true }
