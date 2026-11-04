@@ -6,10 +6,10 @@
 #   GH_TOKEN="Basic $(printf 'x-access-token:%s' "$(gh auth token)" | base64 | tr -d '\n')" \
 #     smolvm machine start --name proj                                   # reads credentials from here
 #   smolvm machine exec --name proj -u user -it -- zsh -l
-#   open http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=scale       # the desktop
+#   smolvm machine exec --name proj -u user -- wrap-desktop url        # the desktop viewer's sign-in link
 #
 # The image's own CMD (`wrap-desktop run`) is the workload: it brings up Xvfb,
-# XFCE, Chrome (CDP), VNC and noVNC, and keeps the machine up.
+# XFCE, Chrome (CDP) and the voxl viewer on 6080, and keeps the machine up.
 image = "ghcr.io/tobi/wrapvm:desktop"
 cpus = 4
 memory = 8192

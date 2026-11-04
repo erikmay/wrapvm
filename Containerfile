@@ -1,21 +1,73 @@
-# wrapvm: the wrap base image + a headless X desktop (Xvfb + XFCE), one
-# persistent Google Chrome on that desktop with CDP on localhost:9222 and every
-# first-run/setup prompt suppressed system-wide, agent-browser preconfigured to
-# attach to that Chrome — so a human (via VNC) and the agent share the same
-# browser — and agent-desktop, which sees and drives the desktop's apps through
-# the AT-SPI accessibility tree. This file is the one definition of the VM:
+# wrapvm: tobi/wrap's desktop (Containerfile.desktop at c562a7d) plus ffmpeg and
+# a workspace agent-browser config. This file is the one definition of the VM:
 # CI publishes it as ghcr.io/tobi/wrapvm:desktop, which the Smolfile boots.
+#
+# wrap desktop: base image + a headless X desktop (Xvfb + XFCE), one persistent
+# Google Chrome on that desktop with CDP on localhost:9222 and every first-run/
+# setup prompt suppressed system-wide, and agent-browser preconfigured to attach
+# to that Chrome — so a human (in the browser viewer) and the agent share the
+# same browser.
 #
 #   docker run -d ghcr.io/tobi/wrapvm:desktop            # desktop + chrome up
 #   docker run -it ghcr.io/tobi/wrapvm:desktop           # shell, desktop autostarts
 #   -e WRAP_DESKTOP_AUTOSTART=0                          # opt out of autostart
 #
-# VNC :5900 and noVNC :6080 listen on all guest interfaces so the VM/container
-# port publish (which targets the guest NIC, not its loopback) can reach them;
-# the host side of that publish is loopback-only. Chrome only binds CDP to
-# 127.0.0.1:9222 (it ignores --remote-debugging-address with a window), so a
-# socat forwarder serves it on all guest interfaces at :9223.
+# The viewer, voxl on :6080, listens on all guest interfaces so the VM/container
+# port publish (which targets the guest NIC, not its loopback) can reach it; the
+# host side of that publish is loopback-only, and voxl still asks for a password
+# and refuses other sites' pages. Chrome only binds CDP to 127.0.0.1:9222 (it
+# ignores --remote-debugging-address with a window), so a socat forwarder serves
+# it on all guest interfaces at :9223.
 ARG BASE_IMAGE=ghcr.io/tobi/wrap:latest
+
+# ---------------------------------------------------------------------------
+# voxl (github.com/tembo/voxl) is the viewer: it streams :1 to a browser as
+# H.264 over one WebSocket (WebCodecs decodes it) and sends input, clipboard
+# and file transfers back. It has no release binaries, so this stage builds a
+# pinned commit on the same base the image runs on; only the binary leaves it,
+# and the image installs the four libraries it links (x264, libyuv, opus,
+# libpulse). Everything else here — Rust, esbuild, the crates — stays behind.
+# ---------------------------------------------------------------------------
+FROM ${BASE_IMAGE} AS voxl
+# The base puts mise's shims first on PATH, and cargo there is a lazy install.
+# Arch's own rust is the toolchain here.
+ENV HOME=/root USER=root CARGO_HOME=/tmp/cargo PATH=/usr/bin:/bin
+RUN pacman -Syu --noconfirm --needed rust esbuild x264 libyuv opus libpulse \
+ && rm -rf /var/cache/pacman/pkg/*
+# Arch's libyuv ships no pkg-config file, and voxl's build.rs asks pkg-config
+# for every library it links.
+RUN install -d /opt/voxl/pkgconfig \
+ && cat > /opt/voxl/pkgconfig/libyuv.pc <<'EOF'
+prefix=/usr
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: libyuv
+Description: YUV conversion and scaling (Arch ships the library without this file)
+Version: 0
+Libs: -L${libdir} -lyuv
+Cflags: -I${includedir}
+EOF
+# main after v0.3.2: it also rebuilds the capture when the X screen changes size
+# (tembo/voxl#49) and no longer panics on a screen below 640x480 (#54).
+ARG VOXL_REV=f5d6ec93dd2745a680054071eae31aec45049a49
+RUN git init -q /src/voxl \
+ && git -C /src/voxl fetch -q --depth 1 https://github.com/tembo/voxl "${VOXL_REV}" \
+ && git -C /src/voxl checkout -q FETCH_HEAD \
+ && test "$(git -C /src/voxl rev-parse HEAD)" = "${VOXL_REV}"
+WORKDIR /src/voxl
+# bindgen 0.71 under Arch's libclang 23 emits x264_param_t as an opaque struct,
+# and encoder.rs then fails on every field it sets (E0609); 0.72.1 parses it.
+# Cargo.lock changes in bindgen's own version and checksum only, so the build
+# stays --locked to the rest of upstream's lockfile.
+RUN sed -i 's/^bindgen = "0.71"$/bindgen = "0.72"/' Cargo.toml \
+ && grep -qx 'bindgen = "0.72"' Cargo.toml \
+ && cargo update --quiet -p bindgen --precise 0.72.1 \
+ && PKG_CONFIG_PATH=/opt/voxl/pkgconfig cargo build --quiet --release --locked \
+ && install -D -m 0755 target/release/voxl /opt/voxl/bin/voxl \
+ && strip /opt/voxl/bin/voxl \
+ && /opt/voxl/bin/voxl --version
+
 FROM ${BASE_IMAGE}
 
 # Build steps run as root; keep root's droppings out of the user's home. The
@@ -24,63 +76,135 @@ ENV HOME=/root USER=root
 
 # One shared X display for everything. agent-browser sees DISPLAY set and puts
 # Chrome on the XFCE desktop instead of spawning a private Xvfb.
+# NO_AT_BRIDGE must not be set: GTK reads it as "do not load the AT-SPI bridge",
+# which hides every app from agent-desktop. GNOME_ACCESSIBILITY=1 says the
+# session has accessibility on, which Chromium reads per process: with
+# --no-startup-window it otherwise never initialises its AT-SPI bridge (checked:
+# a window handed to it later does not change that). The bus itself is switched
+# on by wrap-a11y (see the wrap-desktop section below).
 ENV DISPLAY=:1 \
     WRAP_DESKTOP_GEOMETRY=1280x800x24 \
-    WRAP_DESKTOP_VNC_PORT=5900 \
-    WRAP_DESKTOP_NOVNC_PORT=6080 \
+    WRAP_DESKTOP_VIEWER_PORT=6080 \
     WRAP_DESKTOP_CDP_PORT=9222 \
     WRAP_DESKTOP_CDP_PUBLIC_PORT=9223 \
     XDG_SESSION_TYPE=x11 \
+    GNOME_ACCESSIBILITY=1 \
     AGENT_BROWSER_CONFIG=/home/user/workspace/agent-browser.json
-# No NO_AT_BRIDGE anywhere: set, it makes every GTK and Chromium process skip
-# the accessibility bridge, nothing registers on the AT-SPI bus, and
-# agent-desktop sees no application at all.
 # AGENT_BROWSER_CONFIG replaces agent-browser's config discovery with that one
-# file; wrap-desktop and login shells write its default when it is missing
+# file, in the workspace so a person can change it per project; wrap-desktop
+# and login shells write its default when it is missing
 # (see wrap-agent-browser-config below).
 
 # ---------------------------------------------------------------------------
-# X + XFCE + VNC + Chrome runtime deps (Arch repos). XFCE is assembled from
+# X + XFCE + viewer + Chrome runtime deps (Arch repos). XFCE is assembled from
 # components rather than the `xfce4` group to skip power-manager, screensaver,
 # pulseaudio plugin and friends — nothing here should ever lock or dim :1.
+# x264, libyuv, opus and libpulse are what the voxl binary links (libpulse is
+# the client library only; no sound server runs, so voxl's audio is off).
 # ---------------------------------------------------------------------------
 RUN pacman -Syu --noconfirm --needed \
       xorg-server-xvfb xorg-xauth xorg-xdpyinfo xorg-xset xorg-xrandr xdotool \
-      x11vnc scrot socat \
+      scrot socat x264 libyuv opus libpulse \
       dbus xfce4-session xfwm4 xfdesktop xfce4-panel xfce4-settings xfconf \
       xfce4-terminal thunar xfce4-appfinder garcon adwaita-icon-theme \
       ttf-dejavu ttf-liberation noto-fonts noto-fonts-emoji \
       alsa-lib gtk3 libcups libxss libxtst nss xdg-utils at-spi2-core \
       libxrandr libxcomposite libxdamage libxkbcommon libdrm mesa pango cairo \
       libxshmfence vulkan-icd-loader \
-      dconf gsettings-desktop-schemas ffmpeg \
+      ffmpeg \
  && dbus-uuidgen --ensure=/etc/machine-id \
  && rm -rf /var/cache/pacman/pkg/*
 
-# agent-browser installs on demand through mise's native registry backend,
-# without npm/Node or a custom launcher.
+# dconf profile. The a11y state at-spi keeps (org.a11y.Status IsEnabled, which
+# it mirrors into gsettings' toolkit-accessibility) is written through dconf's
+# user database. Arch ships no /etc/dconf/profile, so dconf falls back to its
+# built-in default; naming it here makes the database layout explicit the way
+# other distributions do. It is not a fix: this image's dconf reads and writes
+# the same key without the file (checked), so do not read it as the reason
+# accessibility used to stay off — that was NO_AT_BRIDGE and IsEnabled below.
+RUN install -d /etc/dconf/profile \
+ && printf '%s\n' 'user-db:user' > /etc/dconf/profile/user
+
+# mise's installs are shared by every bot HOME (MISE_DATA_DIR), but its cache,
+# state and locks default to $HOME. So four bots launching a tool with an update
+# pending take four different locks and race over the one shared install —
+# measured on this image: 3 of 4 launches died with "No executable found for
+# configured tool: agent-desktop" while another process replaced it. One
+# directory per uid, under a sticky parent, gives every process of a uid the
+# same lock domain wherever HOME points, and keeps root in its own: the base
+# image's per-uid defaults exist so a sudo shell cannot poison the user's
+# install state, and this keeps that true.
+#
+# The pin is a snippet two entry points share: /etc/profile.d/wrap.sh (login
+# shells, and every zsh through /etc/zsh/zshenv) and wrap-desktop, which sources
+# it before it starts XFCE, a terminal or Chrome — those are not login shells
+# either. This runs before the eager `mise install` below, so the image's own
+# install populates the same cache and state a plain first call uses; an empty
+# state directory would make that call re-resolve and, offline, stall.
+RUN install -d -m 1777 /opt/mise/cache /opt/mise/state \
+ && cat > /opt/wrap/bin/wrap-mise-env <<'EOF'
+# mise: one cache and state directory per uid, independent of HOME. Sourced by
+# /etc/profile.d/wrap.sh and by wrap-desktop, so a bot's commands and the
+# desktop's own processes share the uid's install lock instead of racing.
+#  - [ -O ]: a directory that is not ours is left alone. Root and the user never
+#    write into each other's state, and a root-owned leftover is not adopted.
+#  - the snippet never fails a shell: every step that can fail ends in `continue`.
+for kind in cache state; do
+  case $kind in
+    cache) var=MISE_CACHE_DIR ;;
+    state) var=MISE_STATE_DIR ;;
+  esac
+  dir="/opt/mise/$kind/$(id -u)"
+  [ -d "/opt/mise/$kind" ] || continue
+  mkdir -p "$dir" 2>/dev/null || continue
+  [ -O "$dir" ] || continue
+  export "$var=$dir"
+done
+EOF
+RUN chmod 0644 /opt/wrap/bin/wrap-mise-env \
+ && printf '%s\n' '[ -r /opt/wrap/bin/wrap-mise-env ] && . /opt/wrap/bin/wrap-mise-env' \
+      >> /etc/profile.d/wrap.sh
+
+# `sudo -E` would carry the user's MISE_CACHE_DIR/MISE_STATE_DIR into a root
+# shell, and root's mise would then leave root-owned locks and a root-owned
+# trust state in the user's directory: the user's next install fails on files it
+# may not write. sudo drops both for every command here. An explicit
+# `sudo --preserve-env=MISE_STATE_DIR …` still hands one over — that is sudo's
+# own escape hatch, and it cannot be closed from sudoers without turning
+# preservation off everywhere.
+RUN cat > /etc/sudoers.d/20-wrap-mise <<'EOF'
+Defaults env_delete += "MISE_CACHE_DIR MISE_STATE_DIR"
+EOF
+RUN chmod 0440 /etc/sudoers.d/20-wrap-mise \
+ && visudo -cf /etc/sudoers.d/20-wrap-mise
+
+# Both agent CLIs are in the image and need no download on first use:
+#
+#  - agent-browser through mise's native registry backend (no npm, no Node in
+#    its call path, no custom launcher).
+#  - agent-desktop through mise's npm backend. The npm package ships the native
+#    binaries; its postinstall is what copies the platform binary over the Node
+#    launcher and puts agent-desktop-linux-clipboard-owner beside it. npm runs
+#    no package scripts by default, and mise's embedded aube follows it, so the
+#    declaration approves exactly that one package (allow_builds) — nothing
+#    else runs, and npm's --ignore-scripts is not turned off globally.
+#    Running the postinstall needs node, which mise installs as a dependency.
+#
+# Updates stay with mise: the base config sets tool_update.global_auto, so an
+# installed tool is refreshed before it launches once mise's check interval has
+# passed. `mise install` here names its tools on purpose: a bare `mise install`
+# would also pull every lazy runtime in the base config, and node is named
+# because mise does not fetch a lazy node for an npm tool by itself (it fails
+# with "failed to resolve configured install dependency 'node@latest'").
 COPY --chown=${WRAP_UID}:${WRAP_GID} resources/mise-desktop.toml /opt/mise/config/conf.d/desktop.toml
-RUN sudo -u "${WRAP_USER_NAME}" -H sh -lc 'mise reshim'
+RUN sudo -u "${WRAP_USER_NAME}" -H sh -lc 'mise install node agent-browser npm:agent-desktop'
 
-# websockify bridges noVNC to x11vnc on every desktop start, so it is baked in.
-# It is AUR-only on Arch: a venv on the system python, which costs ~1MB where
-# mise's own python + uv cost ~240MB. --no-deps skips numpy (it only speeds up
-# unmasking the small client-to-server frames) and the token-plugin libraries.
-RUN /usr/bin/python -m venv /opt/websockify \
- && /opt/websockify/bin/pip install --no-cache-dir --no-deps --quiet websockify \
- && /opt/websockify/bin/pip uninstall --yes --quiet pip \
- && ln -sf /opt/websockify/bin/websockify /usr/local/bin/websockify \
- && chmod -R a+rX /opt/websockify
-
-# noVNC is static files, not a CLI; keep its versioned distribution in the image.
-ARG NOVNC_VERSION=1.6.0
-RUN curl -fsSL "https://github.com/novnc/noVNC/archive/refs/tags/v${NOVNC_VERSION}.tar.gz" \
-      | bsdtar -x -C /tmp \
- && install -d /usr/share \
- && mv "/tmp/noVNC-${NOVNC_VERSION}" /usr/share/novnc \
- && rm -rf /usr/share/novnc/tests /usr/share/novnc/docs /usr/share/novnc/snap \
- && ln -sf vnc.html /usr/share/novnc/index.html \
- && chmod -R a+rX /usr/share/novnc
+# The viewer, from the voxl stage at the top. Its web client is compiled into
+# the binary, so it serves offline. LD_BIND_NOW makes the loader resolve every
+# symbol voxl uses before --version runs: a runtime library that drifted from
+# the one it was built against fails the build here, not a desktop start.
+COPY --from=voxl /opt/voxl/bin/voxl /usr/local/bin/voxl
+RUN LD_BIND_NOW=1 voxl --version
 
 # ---------------------------------------------------------------------------
 # Google Chrome stable, straight from Google's .deb (the AUR package does the
@@ -217,8 +341,12 @@ fi
 # Rotate the caller's arguments (URLs) back behind the configured flags.
 while [ "$n" -gt 0 ]; do a=$1; shift; set -- "$@" "$a"; n=$((n - 1)); done
 # --password-store=basic: never trigger a keyring unlock dialog.
+# --force-renderer-accessibility: publish the web contents on the AT-SPI tree.
+# Chromium leaves renderer accessibility off until an assistive technology is
+# detected, which on this image nothing does; agent-desktop reads desktop apps
+# through that tree (wrap-a11y switches the bus on).
 set -- --disable-dev-shm-usage --no-first-run --no-default-browser-check \
-       --password-store=basic "$@"
+       --password-store=basic --force-renderer-accessibility "$@"
 if [ "$(id -u)" = 0 ]; then
   set -- --no-sandbox "$@"
 fi
@@ -230,13 +358,15 @@ EOF
 # that allows them (microVMs, `--security-opt seccomp=unconfined`).
 # Chrome honors only the last --enable-features: keep both WebMCP features in
 # any replacement line, or agent-browser's `webmcp` commands find no tools.
+# The page API is the WebMCP feature. Chrome 157 removed WebMCPTesting, which
+# 156 also took, so a line that names only that one leaves pages without it.
 RUN cat > /etc/wrap/chrome-flags.conf <<'EOF'
 # Extra Google Chrome flags, one per line. Copy to ~/.config/chrome-flags.conf
 # to change them; restart Chrome with `wrap-desktop stop && wrap-desktop start`.
 --no-sandbox
 # WebMCP: pages register tools on document.modelContext; agent-browser lists
 # and calls them with `agent-browser webmcp list|invoke`.
---enable-features=WebMCPTesting,DevToolsWebMCPSupport
+--enable-features=WebMCP,DevToolsWebMCPSupport
 EOF
 RUN chmod 0755 /usr/local/bin/google-chrome-stable \
  && ln -sf google-chrome-stable /usr/local/bin/google-chrome \
@@ -290,6 +420,58 @@ RUN for home in /root /home/user; do \
       cp /etc/skel/.agent-browser/config.json "$home/.agent-browser/config.json"; \
     done \
  && chown -R "${WRAP_UID}:${WRAP_GID}" /home/user/.agent-browser
+
+# wrapvm: agent-browser's config is AGENT_BROWSER_CONFIG, which replaces the
+# ~/.agent-browser/config.json above. It is written once, when missing, from
+# /etc/wrap/agent-browser.json: headed, and attached to the desktop's running
+# Chrome by discovery.
+RUN cat > /etc/wrap/agent-browser.json <<'EOF'
+{
+  "headed": true,
+  "autoConnect": true
+}
+EOF
+RUN cat > /opt/wrap/bin/wrap-agent-browser-config <<'EOF'
+#!/bin/sh
+# Write the default agent-browser config at $AGENT_BROWSER_CONFIG when nothing
+# is there yet and its directory exists. Never overwrites.
+file="${AGENT_BROWSER_CONFIG:-}"
+[ -n "$file" ] && [ ! -e "$file" ] || exit 0
+dir="$(dirname "$file")"
+[ -d "$dir" ] && [ -w "$dir" ] || exit 0
+(set -C; cat /etc/wrap/agent-browser.json > "$file") 2>/dev/null || exit 0
+# Written by root (a sudo -i shell): it still belongs to the workspace's owner.
+[ "$(id -u)" != 0 ] || chown "$(stat -c %u:%g "$dir")" "$file"
+EOF
+# The image's own workspace gets it now, for a container without a workspace
+# mount: agent-browser refuses to run while AGENT_BROWSER_CONFIG names a
+# missing file. A mounted workspace gets it from the desktop's first start.
+RUN chmod 0755 /opt/wrap/bin/wrap-agent-browser-config \
+ && install -o "${WRAP_UID}" -g "${WRAP_GID}" -m 0644 /etc/wrap/agent-browser.json \
+      /home/user/workspace/agent-browser.json
+
+# wrapvm: agent-browser's guides (`agent-browser skills get core`). The native
+# build mise installs has no skill-data beside it (only the npm package ships
+# one), so it is fetched from the release the image installed. mise updates the
+# binary later on its own; the guides of this version stay until a rebuild.
+ENV AGENT_BROWSER_SKILLS_DIR=/opt/agent-browser/skill-data
+RUN v="$(sudo -u "${WRAP_USER_NAME}" -H sh -lc 'agent-browser --version' | awk '{print $2}')" \
+ && install -d /opt/agent-browser \
+ && curl -fsSL "https://github.com/vercel-labs/agent-browser/archive/refs/tags/v$v.tar.gz" \
+      | bsdtar -x -C /opt/agent-browser --strip-components 1 "agent-browser-$v/skill-data" \
+ && chmod -R a+rX /opt/agent-browser \
+ && sudo -u "${WRAP_USER_NAME}" -H env AGENT_BROWSER_SKILLS_DIR="$AGENT_BROWSER_SKILLS_DIR" sh -lc 'agent-browser skills get core' | head -3 | grep -qx 'name: core'
+
+# wrapvm: the desktop and browser skills, global for agents (pi, Claude Code,
+# Codex read ~/.agents/skills). Seeded into /etc/skel and both existing homes;
+# /etc/wrap/skills keeps a copy for an agent whose HOME is somewhere else.
+COPY skills/ /etc/wrap/skills/
+RUN for home in /etc/skel /root /home/user; do \
+      install -d "$home/.agents/skills"; \
+      cp -a /etc/wrap/skills/. "$home/.agents/skills/"; \
+    done \
+ && chmod -R a+rX /etc/wrap/skills \
+ && chown -R "${WRAP_UID}:${WRAP_GID}" /home/user/.agents
 
 # XFCE look: no top bar, one centered bottom dock with three launchers
 # (Chrome / Thunar / Terminal) on a transparent panel, solid navy backdrop,
@@ -384,9 +566,13 @@ RUN cat > /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml <
   </property>
 </channel>
 EOF
-# No compositing: with it on, a whole-screen capture (agent-desktop screenshot
-# --screen 0) is refused as PLATFORM_NOT_SUPPORTED; window capture works either
-# way. The other xfwm4 settings keep their defaults.
+# Compositing off. With xfwm4's compositor running, the X root window holds only
+# the compositor's own stage, not the app windows, so a whole-screen capture
+# cannot see what is on screen; agent-desktop refuses it outright
+# (`screenshot --screen 0` -> PLATFORM_NOT_SUPPORTED, reason compositing).
+# Without a compositor the root window holds the windows themselves and the
+# capture is truthful. Nothing in this desktop needs the compositor: no
+# transparency, no shadows, no window previews.
 RUN cat > /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <channel name="xfwm4" version="1.0">
@@ -402,133 +588,142 @@ RUN for home in /root /home/user; do \
  && chown -R "${WRAP_UID}:${WRAP_GID}" /home/user/.config
 
 # ---------------------------------------------------------------------------
-# agent-desktop: the desktop's apps through the AT-SPI accessibility tree
-# (snapshot, refs, click, type, windows, clipboard, screenshots). The release
-# binary needs nothing but libc, so it is installed directly, checksum-verified,
-# rather than through npm (whose new default skips the package's postinstall).
+# wrap-a11y: switch the AT-SPI accessibility bus on for this session.
+#
+# agent-desktop reads desktop apps through AT-SPI, and a toolkit publishes its
+# tree only while org.a11y.Status.IsEnabled is true on the session bus. at-spi's
+# bus launcher keeps that flag in memory (bus/at-spi-bus-launcher.c: it is
+# zero-initialised, written to gsettings' toolkit-accessibility in
+# handle_a11y_enabled_change and cleared when no app holds an event listener),
+# so it is an input that must be set after every launcher start — `gsettings set
+# org.gnome.desktop.interface toolkit-accessibility true` alone does nothing.
+#
+#   wrap-a11y enable [--quiet]  switch it on if it is off; safe to repeat
+#   wrap-a11y status            print the state, exit 0 when it is on
+#   wrap-a11y watch             keep it on: re-enable when a launcher appears
+#                               or when the bus reports IsEnabled false itself
+#
+# Every wait is bounded (a condition with a deadline, never a forever poll).
 # ---------------------------------------------------------------------------
-ARG AGENT_DESKTOP_VERSION=1.0.2
-RUN arch="$(uname -m)" \
- && name="agent-desktop-v${AGENT_DESKTOP_VERSION}-${arch}-unknown-linux-gnu.tar.gz" \
- && base="https://github.com/vercel-labs/agent-desktop/releases/download/v${AGENT_DESKTOP_VERSION}" \
- && cd /tmp \
- && curl -fsSLO "$base/$name" \
- && curl -fsSL "$base/checksums.txt" | grep " $name\$" | sha256sum -c - \
- && install -d /opt/agent-desktop \
- && bsdtar -x -C /opt/agent-desktop -f "$name" \
- && rm -f "$name" \
- && chmod -R a+rX /opt/agent-desktop \
- && ln -sf /opt/agent-desktop/agent-desktop /usr/local/bin/agent-desktop \
- && agent-desktop version
-
-# GTK and Chromium only register on the AT-SPI bus when the session's a11y bus
-# says IsEnabled=true; Chromium exports no tree while it is false, whatever its
-# flags. gsettings' toolkit-accessibility does not reach the bus launcher, so
-# wrap-desktop sets the property itself, once the bus is up and again on every
-# supervision pass (a restarted launcher comes back false).
 RUN cat > /opt/wrap/bin/wrap-a11y <<'EOF'
 #!/bin/sh
-# Make the session's accessibility bus report IsEnabled=true (idempotent).
-# Calling org.a11y.Bus starts the bus launcher when it is not running yet.
 set -eu
-export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/wrap-desktop-$(id -u)/runtime}"
-export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
-enabled="$(gdbus call --session -d org.a11y.Bus -o /org/a11y/bus \
-  -m org.freedesktop.DBus.Properties.Get org.a11y.Status IsEnabled 2>/dev/null || true)"
-case "$enabled" in *true*) exit 0 ;; esac
-gdbus call --session -d org.a11y.Bus -o /org/a11y/bus \
-  -m org.freedesktop.DBus.Properties.Set org.a11y.Status IsEnabled '<true>' >/dev/null
+: "${XDG_RUNTIME_DIR:=/tmp/wrap-desktop-$(id -u)/runtime}"
+: "${DBUS_SESSION_BUS_ADDRESS:=unix:path=$XDG_RUNTIME_DIR/bus}"
+export XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+quiet=0
+say() { [ "$quiet" = 1 ] || printf '%s\n' "$*" >&2; }
+
+bus_up() {
+  dbus-send --session --dest=org.freedesktop.DBus --type=method_call \
+    /org/freedesktop/DBus org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1
+}
+
+# The property, not gsettings: the launcher writes gsettings from it.
+is_enabled() {
+  gdbus call --session -d org.a11y.Bus -o /org/a11y/bus \
+    -m org.freedesktop.DBus.Properties.Get org.a11y.Status IsEnabled 2>/dev/null \
+    | grep -q 'true'
+}
+
+# D-Bus activates the launcher and its private bus on first use, so this also
+# brings the a11y bus itself up when nothing has asked for it yet.
+launcher_up() {
+  gdbus call --session -d org.a11y.Bus -o /org/a11y/bus \
+    -m org.a11y.Bus.GetAddress >/dev/null 2>&1
+}
+
+wait_for() { # tries command...
+  tries=$1; shift
+  i=0
+  until "$@"; do
+    i=$((i + 1)); [ "$i" -lt "$tries" ] || return 1
+    sleep 0.1
+  done
+}
+
+# The desktop belongs to the uid that started its Xvfb. Only that uid may switch
+# the bus on: the launcher publishes its address on the shared root window, so a
+# second uid (a `sudo -i` login shell runs `wrap-desktop start` too) would start
+# a launcher of its own and point every app — the user's included — at a bus
+# under /tmp/wrap-desktop-0 that they cannot connect to.
+owns_desktop() {
+  pidfile="/tmp/wrap-desktop-$(id -u)/xvfb.pid"
+  [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null
+}
+
+enable() {
+  if ! owns_desktop; then
+    say "wrap-a11y: the desktop is not this uid's; leaving accessibility to its owner"
+    return 0
+  fi
+  if ! wait_for 100 bus_up; then
+    say "wrap-a11y: no session bus at $DBUS_SESSION_BUS_ADDRESS"
+    return 1
+  fi
+  if ! launcher_up; then
+    say "wrap-a11y: org.a11y.Bus did not answer"
+    return 1
+  fi
+  # Already on: nothing to write (a repeat call costs two D-Bus calls).
+  if is_enabled; then
+    say "accessibility already on"
+    return 0
+  fi
+  if ! gdbus call --session -d org.a11y.Bus -o /org/a11y/bus \
+      -m org.freedesktop.DBus.Properties.Set \
+      org.a11y.Status IsEnabled '<true>' >/dev/null; then
+    say "wrap-a11y: setting org.a11y.Status IsEnabled failed"
+    return 1
+  fi
+  if ! wait_for 20 is_enabled; then
+    say "wrap-a11y: org.a11y.Status IsEnabled did not stay true"
+    return 1
+  fi
+  say "accessibility on"
+}
+
+# Event-driven recovery, on the bus's own signals: gdbus prints one line per
+# event, so nothing has to be parsed. Two of them matter:
+#
+#   "The name org.a11y.Bus is owned by :1.7" / "does not have an owner"
+#       — a launcher appeared (a fresh one starts switched off) or went away.
+#   "/org/a11y/bus: …PropertiesChanged ('org.a11y.Status', {'IsEnabled': <false>}, @as [])"
+#       — the launcher switched itself off, which it does when the last client
+#       that held an AT-SPI event listener disconnects (at-spi-bus-launcher.c,
+#       event_listener_vanished_callback). No name change is involved, so this
+#       is the only event that says accessibility just went off.
+#
+# Only a false value is acted on; our own write reports <true>, so this cannot
+# loop. When the session bus goes away the monitor ends; `wrap-desktop run`
+# starts this piece again and `start` switches accessibility on there too.
+watch() {
+  enable || true
+  owns_desktop || return 0
+  gdbus monitor --session --dest org.a11y.Bus 2>/dev/null |
+  while read -r line; do
+    case "$line" in
+      *'name org.a11y.Bus'*) enable || true ;;
+      *PropertiesChanged*"'IsEnabled': <false>"*) enable || true ;;
+    esac
+  done
+}
+
+cmd="${1:-enable}"; [ $# -gt 0 ] && shift
+for a in "$@"; do [ "$a" = "--quiet" ] && quiet=1; done
+case "$cmd" in
+  enable) enable ;;
+  watch)  watch ;;
+  status)
+    if is_enabled; then say "accessibility on"; else say "accessibility off"; exit 1; fi ;;
+  *) echo "usage: wrap-a11y enable [--quiet] | status | watch | (watch: re-enables on a new launcher or an IsEnabled false report)" >&2; exit 2 ;;
+esac
 EOF
 RUN chmod 0755 /opt/wrap/bin/wrap-a11y
 
-# dconf needs a profile, or gsettings writes nothing for a HOME that has no
-# database yet (a bot's home): `gsettings set` returns 0 and the next read
-# gives the old value.
-RUN install -d /etc/dconf/profile \
- && printf 'user-db:user\n' > /etc/dconf/profile/user
-
-# A small GTK app for checking the accessibility path end to end: a text
-# field, Greet and Clear buttons, and a label that answers "Hello, <name>!".
-#   gtk-demo & agent-desktop find --app gtk-demo --role textfield
-RUN cat > /tmp/gtk-demo.c <<'EOF'
-#include <gtk/gtk.h>
-
-static GtkWidget *label, *entry;
-
-static void on_greet(GtkWidget *button, gpointer data) {
-  const char *text = gtk_entry_get_text(GTK_ENTRY(entry));
-  char *message = (text && *text) ? g_strdup_printf("Hello, %s!", text) : g_strdup("Nothing typed yet");
-  gtk_label_set_text(GTK_LABEL(label), message);
-  g_free(message);
-}
-
-static void on_clear(GtkWidget *button, gpointer data) {
-  gtk_entry_set_text(GTK_ENTRY(entry), "");
-  gtk_label_set_text(GTK_LABEL(label), "Cleared");
-}
-
-int main(int argc, char **argv) {
-  gtk_init(&argc, &argv);
-  GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-  gtk_window_set_title(GTK_WINDOW(window), "agent-desktop demo");
-  gtk_window_set_default_size(GTK_WINDOW(window), 560, 300);
-
-  GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
-  gtk_container_set_border_width(GTK_CONTAINER(box), 24);
-  label = gtk_label_new("Ready");
-  gtk_label_set_xalign(GTK_LABEL(label), 0.0);
-  entry = gtk_entry_new();
-  gtk_entry_set_placeholder_text(GTK_ENTRY(entry), "type a name here");
-
-  GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
-  GtkWidget *greet = gtk_button_new_with_label("Greet");
-  GtkWidget *clear = gtk_button_new_with_label("Clear");
-  gtk_box_pack_start(GTK_BOX(row), greet, FALSE, FALSE, 0);
-  gtk_box_pack_start(GTK_BOX(row), clear, FALSE, FALSE, 0);
-  g_signal_connect(greet, "clicked", G_CALLBACK(on_greet), NULL);
-  g_signal_connect(clear, "clicked", G_CALLBACK(on_clear), NULL);
-  g_signal_connect(window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
-
-  gtk_box_pack_start(GTK_BOX(box), label, FALSE, FALSE, 0);
-  gtk_box_pack_start(GTK_BOX(box), entry, FALSE, FALSE, 0);
-  gtk_box_pack_start(GTK_BOX(box), row, FALSE, FALSE, 0);
-  gtk_container_add(GTK_CONTAINER(window), box);
-  gtk_widget_show_all(window);
-  gtk_main();
-  return 0;
-}
-EOF
-RUN cc -O2 -o /usr/local/bin/gtk-demo /tmp/gtk-demo.c $(pkg-config --cflags --libs gtk+-3.0) \
- && rm /tmp/gtk-demo.c
-
-# agent-browser's config is AGENT_BROWSER_CONFIG, in the workspace, so a
-# person can change it per project. It is written once, when missing, from
-# /etc/wrap/agent-browser.json: headed, and attached to the desktop's running
-# Chrome by discovery. That file replaces ~/.agent-browser/config.json.
-RUN install -d /etc/wrap \
- && cat > /etc/wrap/agent-browser.json <<'EOF'
-{
-  "headed": true,
-  "autoConnect": true
-}
-EOF
-RUN cat > /opt/wrap/bin/wrap-agent-browser-config <<'EOF'
-#!/bin/sh
-# Write the default agent-browser config at $AGENT_BROWSER_CONFIG when nothing
-# is there yet and its directory exists. Never overwrites.
-file="${AGENT_BROWSER_CONFIG:-}"
-[ -n "$file" ] && [ ! -e "$file" ] || exit 0
-dir="$(dirname "$file")"
-[ -d "$dir" ] && [ -w "$dir" ] || exit 0
-(set -C; cat /etc/wrap/agent-browser.json > "$file") 2>/dev/null || exit 0
-# Written by root (a sudo -i shell): it still belongs to the workspace's user.
-[ "$(id -u)" != 0 ] || chown "$(stat -c %u:%g "$dir")" "$file"
-EOF
-RUN chmod 0755 /opt/wrap/bin/wrap-agent-browser-config
-
 # ---------------------------------------------------------------------------
-# wrap-desktop: idempotent supervisor for Xvfb :1 + XFCE + Chrome (CDP) +
-# x11vnc + noVNC. Runs as whoever calls it (normally `user`). Xvfb is started
+# wrap-desktop: idempotent supervisor for Xvfb :1 + XFCE + Chrome (CDP) + the
+# voxl viewer. Runs as whoever calls it (normally `user`). Xvfb is started
 # with -ac so any uid in the VM (sudo, root plumbing) can also draw on :1.
 # Each `start` re-spawns whichever piece has died, so a crashed Chrome comes
 # back on the next login shell; `run` also does that every
@@ -539,7 +734,12 @@ RUN chmod 0755 /opt/wrap/bin/wrap-agent-browser-config
 #   wrap-desktop status            exit 0 when :1 answers
 #   wrap-desktop stop              tear down what this uid started
 #   wrap-desktop run               start, supervise, block (container CMD)
-#   wrap-desktop url               print the noVNC URL
+#   wrap-desktop url [ADDRESS]     print the viewer's sign-in link
+#   wrap-desktop password          print the viewer's password
+#
+# Accessibility: `start` switches the AT-SPI bus on (wrap-a11y) before XFCE and
+# Chrome start, and supervises `wrap-a11y watch`, so agent-desktop can read the
+# desktop's apps and a bus launcher that dies mid-session comes back on its own.
 # ---------------------------------------------------------------------------
 RUN cat > /opt/wrap/bin/wrap-desktop <<'EOF'
 #!/bin/sh
@@ -547,8 +747,8 @@ set -eu
 
 : "${DISPLAY:=:1}"
 : "${WRAP_DESKTOP_GEOMETRY:=1280x800x24}"
-: "${WRAP_DESKTOP_VNC_PORT:=5900}"
-: "${WRAP_DESKTOP_NOVNC_PORT:=6080}"
+: "${WRAP_DESKTOP_VIEWER_PORT=6080}"
+: "${WRAP_DESKTOP_VOXL_ARGS:=}"
 : "${WRAP_DESKTOP_CDP_PORT:=9222}"
 : "${WRAP_DESKTOP_CDP_PUBLIC_PORT=9223}"
 : "${WRAP_DESKTOP_CHROME_PROFILE:=$HOME/.config/wrap-chrome}"
@@ -564,6 +764,9 @@ log="$run_dir/desktop.log"
 # login shells by /etc/profile.d/wrap-desktop.sh so later GUI launches join it.
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-$run_dir/runtime}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+# The desktop's children (XFCE, terminals, Chrome) are not login shells, so they
+# get the uid's mise cache/state here rather than from /etc/profile.d.
+[ -r /opt/wrap/bin/wrap-mise-env ] && . /opt/wrap/bin/wrap-mise-env
 quiet=0
 
 say() { [ "$quiet" = 1 ] || printf '%s\n' "$*" >&2; }
@@ -571,6 +774,8 @@ say() { [ "$quiet" = 1 ] || printf '%s\n' "$*" >&2; }
 display_up() { xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; }
 bus_up() { dbus-send --session --dest=org.freedesktop.DBus --type=method_call \
   /org/freedesktop/DBus org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1; }
+# This uid's desktop is the one whose Xvfb it started (same rule as wrap-a11y).
+owns_desktop() { [ -f "$run_dir/xvfb.pid" ] && kill -0 "$(cat "$run_dir/xvfb.pid" 2>/dev/null)" 2>/dev/null; }
 
 # Chrome trusts NSS (~/.pki/nssdb), not the system CA store. Import every local
 # CA anchor so TLS-intercepting sandboxes (microsandbox secret injection puts
@@ -590,6 +795,62 @@ trust_local_cas() {
   done
 }
 cdp_up() { curl -fsS -m 1 "http://127.0.0.1:$WRAP_DESKTOP_CDP_PORT/json/version" >/dev/null 2>&1; }
+viewer_on() { case "$WRAP_DESKTOP_VIEWER_PORT" in ''|0) return 1 ;; esac; }
+viewer_up() { curl -fsS -m 1 -o /dev/null "http://127.0.0.1:$WRAP_DESKTOP_VIEWER_PORT/healthz" 2>/dev/null; }
+
+# The viewer's password: WRAP_DESKTOP_PASSWORD when set, else one made up (128
+# random bits) on the owner's first start and kept in
+# /var/lib/wrap-desktop/<uid>/password, so a saved link keeps working across
+# restarts; write your own into that file to choose it. Per uid, not per HOME:
+# a bot with a HOME of its own (same uid) must read the password the running
+# viewer has, not make up a second one. The link needs the desktop owner's
+# password, and the owner is whoever runs the X server, so owns its socket;
+# root (`docker exec` without -u) can read that file too, another uid cannot.
+password_file() { printf '/var/lib/wrap-desktop/%s/password\n' "${1:-$(id -u)}"; }
+desktop_uid() { stat -c %u "/tmp/.X11-unix/X$dpy_num" 2>/dev/null || id -u; }
+viewer_password() {
+  if [ -n "${WRAP_DESKTOP_PASSWORD:-}" ]; then
+    printf '%s\n' "$WRAP_DESKTOP_PASSWORD"
+    return 0
+  fi
+  f="$(password_file "$(desktop_uid)")"
+  [ -s "$f" ] || return 1
+  p="$(head -n 1 "$f")"
+  [ -n "$p" ] && printf '%s\n' "$p"
+}
+# Two starts racing each other both write a candidate; ln never replaces a file,
+# so whichever lands first is the password for both. A directory this uid does
+# not own is not used (the parent is sticky and world-writable, like /tmp).
+ensure_password() {
+  [ -z "${WRAP_DESKTOP_PASSWORD:-}" ] || return 0
+  f="$(password_file)"
+  [ ! -s "$f" ] || return 0
+  install -d -m 0700 "${f%/*}" && [ -O "${f%/*}" ] || return 1
+  # An empty file left behind (a full disk, a crash) is not a password.
+  if [ -e "$f" ] && [ ! -s "$f" ]; then rm -f "$f"; fi
+  tmp="$f.$$"
+  (umask 077 && od -An -N16 -tx1 /dev/urandom | tr -d ' \n' >"$tmp" && echo >>"$tmp")
+  ln "$tmp" "$f" 2>/dev/null || true
+  rm -f "$tmp"
+}
+
+# voxl on every guest interface (the port publish targets the guest NIC). The
+# password reaches it through its environment, which only its own uid can read,
+# never through argv, which any uid sees in ps. Audio is off: no sound server
+# runs here. WRAP_DESKTOP_VOXL_ARGS adds flags, e.g. --allowed-hosts=NAME to
+# answer for a proxy's host name, or --read-only.
+start_viewer() {
+  ensure_password || { say "viewer: cannot keep a password in $(password_file)"; return 1; }
+  pw="$(viewer_password)" || { say "viewer: no password in $(password_file)"; return 1; }
+  title="$(cat /proc/sys/kernel/hostname 2>/dev/null || echo wrap) desktop"
+  (
+    set -f
+    export VOXL_PASSWORD="$pw"
+    # shellcheck disable=SC2086 # a list of flags, split on purpose
+    spawn viewer voxl --addr=0.0.0.0 --port="$WRAP_DESKTOP_VIEWER_PORT" \
+      --audio-enabled=false --title="$title" $WRAP_DESKTOP_VOXL_ARGS
+  )
+}
 
 spawn() { # name cmd...
   name="$1"; shift
@@ -612,30 +873,47 @@ start() {
     done
   fi
   trust_local_cas
+  fresh_desktop=0
   if display_up; then
     say "desktop already up on $DISPLAY"
   else
     rm -f "/tmp/.X${dpy_num}-lock" "/tmp/.X11-unix/X${dpy_num}"
+    # -shmem keeps the framebuffer in a SysV segment that voxl reads in place;
+    # without it voxl copies every frame out of the server with GetImage.
     spawn xvfb Xvfb "$DISPLAY" -screen 0 "$WRAP_DESKTOP_GEOMETRY" -ac -nolisten tcp \
-      +extension GLX +extension RANDR +render -noreset
+      +extension GLX +extension RANDR +render -noreset -shmem
     i=0
     until display_up; do
       i=$((i + 1)); [ "$i" -lt 100 ] || { say "Xvfb did not come up (see $log)"; return 1; }
       sleep 0.1
     done
     xset -display "$DISPLAY" s off -dpms >/dev/null 2>&1 || true
+    fresh_desktop=1
+  fi
+  # Accessibility, after X is up: the bus launcher publishes AT_SPI_BUS on the
+  # root window, which is how Chromium finds the bus, so it cannot run before
+  # the display answers. Only the uid that owns this desktop switches it on —
+  # a `sudo -i` login shell runs `start` too, and a launcher of its own would
+  # take the root window's address over with a bus the user cannot connect to.
+  # Both calls are idempotent and cheap, so every `start` re-checks them.
+  if owns_desktop; then
+    wrap-a11y enable --quiet || say "accessibility did not switch on (see $log)"
+    spawn a11y wrap-a11y watch
+  else
+    say "desktop belongs to another uid; leaving accessibility to its owner"
+  fi
+  if [ "$fresh_desktop" = 1 ]; then
     # startxfce4 with DISPLAY and DBUS_SESSION_BUS_ADDRESS set runs xinitrc
     # directly (xfwm4, xfdesktop, panel) instead of launching its own X/dbus.
     spawn xfce startxfce4
     say "desktop up on $DISPLAY ($WRAP_DESKTOP_GEOMETRY)"
   fi
-  # Before Chrome starts: it reads IsEnabled at launch. Every pass re-asserts it.
-  /opt/wrap/bin/wrap-a11y >>"$log" 2>&1 || say "could not enable the accessibility bus (see $log)"
   /opt/wrap/bin/wrap-agent-browser-config
-  spawn x11vnc x11vnc -display "$DISPLAY" -forever -shared -nopw -noxdamage -xkb \
-    -rfbport "$WRAP_DESKTOP_VNC_PORT" -quiet
-  spawn novnc websockify --web /usr/share/novnc \
-    "0.0.0.0:$WRAP_DESKTOP_NOVNC_PORT" "127.0.0.1:$WRAP_DESKTOP_VNC_PORT"
+  # The viewer streams this uid's desktop; another uid's `start` (a `sudo -i`
+  # login shell) leaves it to the owner, as it does accessibility.
+  if viewer_on && owns_desktop; then
+    start_viewer || say "viewer did not start (see $log)"
+  fi
   # The one shared Chrome. Explicit --user-data-dir is mandatory: Chrome >= 136
   # refuses --remote-debugging-port on the default profile directory.
   if ! cdp_up; then
@@ -655,7 +933,9 @@ start() {
     spawn cdp-public socat "TCP-LISTEN:$WRAP_DESKTOP_CDP_PUBLIC_PORT,bind=0.0.0.0,reuseaddr,fork" \
       "TCP:127.0.0.1:$WRAP_DESKTOP_CDP_PORT"
   fi
-  say "vnc  :$WRAP_DESKTOP_VNC_PORT   novnc http://127.0.0.1:$WRAP_DESKTOP_NOVNC_PORT/vnc.html (via port publish)"
+  if viewer_on; then
+    say "view http://127.0.0.1:$WRAP_DESKTOP_VIEWER_PORT/ (via port publish; \`wrap-desktop url\` prints the sign-in link)"
+  fi
   say "cdp  http://127.0.0.1:$WRAP_DESKTOP_CDP_PORT  (agent-browser attaches here; :$WRAP_DESKTOP_CDP_PUBLIC_PORT on guest interfaces)"
 }
 
@@ -673,8 +953,22 @@ for a in "$@"; do [ "$a" = "--quiet" ] && quiet=1; done
 case "$cmd" in
   start)  start ;;
   stop)   stop ;;
-  status) if display_up; then say "up on $DISPLAY"; else say "down"; exit 1; fi ;;
-  url)    printf 'http://127.0.0.1:%s/vnc.html\n' "$WRAP_DESKTOP_NOVNC_PORT" ;;
+  status)
+    if ! display_up; then say "down"; exit 1; fi
+    if viewer_on && viewer_up; then say "up on $DISPLAY, viewer on :$WRAP_DESKTOP_VIEWER_PORT"
+    else say "up on $DISPLAY, viewer down"; fi ;;
+  # The sign-in link: the password rides in ?token=, which voxl's page passes on
+  # to its socket. ADDRESS is where the browser reaches the published port
+  # (default 127.0.0.1:<viewer port>); a full http(s):// URL, such as an HTTPS
+  # proxy in front of it, is used as the base instead.
+  url)
+    pw="$(viewer_password)" || { echo "wrap-desktop: no viewer password yet; start the desktop first" >&2; exit 1; }
+    base="${1:-127.0.0.1:$WRAP_DESKTOP_VIEWER_PORT}"
+    case "$base" in *://*) ;; *) base="http://$base" ;; esac
+    printf '%s/?token=%s\n' "${base%/}" "$(printf '%s' "$pw" | jq -sRr @uri)" ;;
+  # For scripts: curl -u ":$(wrap-desktop password)" localhost:6080/screenshot
+  password)
+    viewer_password || { echo "wrap-desktop: no viewer password yet; start the desktop first" >&2; exit 1; } ;;
   run)
     # Sleep in the background and `wait`: a foreground sleep defers the TERM
     # trap until it returns, so `docker stop` would always hit its kill timeout.
@@ -688,13 +982,16 @@ case "$cmd" in
         sleep 3600 & wait $! || true
       fi
     done ;;
-  # Whole-desktop capture (what a human would see over VNC), for agents that
+  # Whole-desktop capture (what a human sees in the viewer), for agents that
   # want more than agent-browser's page screenshot.
   screenshot) out="${1:-/tmp/wrap-desktop-$(date +%s).png}"; scrot -o "$out" && printf '%s\n' "$out" ;;
-  *) echo "usage: wrap-desktop start [--quiet] | stop | status | run | url | screenshot [FILE]" >&2; exit 2 ;;
+  *) echo "usage: wrap-desktop start [--quiet] | stop | status | run | url [ADDRESS] | password | screenshot [FILE]" >&2; exit 2 ;;
 esac
 EOF
-RUN chmod 0755 /opt/wrap/bin/wrap-desktop
+# Each uid keeps its viewer password in a 0700 directory of its own under this
+# sticky parent (see wrap-desktop's password_file).
+RUN chmod 0755 /opt/wrap/bin/wrap-desktop \
+ && install -d -m 1777 /var/lib/wrap-desktop
 
 # Autostart from login shells (wrap enters every session via `zsh -l`; docker
 # `-it` shells too). /etc/profile sources profile.d for sh/bash, and Arch's
@@ -703,10 +1000,11 @@ RUN cat > /etc/profile.d/wrap-desktop.sh <<'EOF'
 export DISPLAY="${DISPLAY:-:1}"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/wrap-desktop-$(id -u)/runtime}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
-export AGENT_BROWSER_CONFIG="${AGENT_BROWSER_CONFIG:-/home/user/workspace/agent-browser.json}"
 if [ "${WRAP_DESKTOP_AUTOSTART:-1}" = 1 ] && [ -x /opt/wrap/bin/wrap-desktop ]; then
   /opt/wrap/bin/wrap-desktop start --quiet >/dev/null 2>&1 || true
 fi
+export AGENT_BROWSER_CONFIG="${AGENT_BROWSER_CONFIG:-/home/user/workspace/agent-browser.json}"
+export AGENT_BROWSER_SKILLS_DIR="${AGENT_BROWSER_SKILLS_DIR:-/opt/agent-browser/skill-data}"
 /opt/wrap/bin/wrap-agent-browser-config 2>/dev/null || true
 EOF
 
@@ -715,7 +1013,8 @@ RUN cat > /etc/wrap/desktop.md <<'EOF'
 # wrap desktop
 
 - X display `:1` (Xvfb, 1280x800) running XFCE. Autostarts from login shells;
-  `wrap-desktop start|stop|status|url|screenshot [FILE]` (screenshot = whole desktop).
+  `wrap-desktop start|stop|status|url|password|screenshot [FILE]` (screenshot =
+  whole desktop).
 - Local CA anchors (e.g. a TLS-intercepting sandbox's CA) are imported into
   Chrome's NSS store at start, so intercepted hosts load without cert errors.
 - One persistent Google Chrome on that desktop (no window until something opens
@@ -728,18 +1027,44 @@ RUN cat > /etc/wrap/desktop.md <<'EOF'
 - agent-browser reads $AGENT_BROWSER_CONFIG (/home/user/workspace/agent-browser.json,
   written once when missing: `{"headed": true, "autoConnect": true}`), so it
   attaches to that Chrome: `agent-browser open https://example.com` acts in the
-  same browser a human sees over VNC and can take over (log in, solve a captcha,
+  same browser a human sees in the viewer and can take over (log in, solve a captcha,
   hand back). Edit that file per workspace; it replaces ~/.agent-browser/config.json.
   `agent-browser doctor` verifies.
-- agent-desktop drives the desktop's apps through the AT-SPI tree: start with
-  `agent-desktop status` and `agent-desktop skills get desktop`. The a11y bus
-  reports IsEnabled=true (`wrap-a11y` re-asserts it) and NO_AT_BRIDGE is unset,
-  so GTK apps and Chrome register. `gtk-demo` is a small GTK app to try it on.
-  xfwm4 runs without compositing, so whole-screen capture works.
 - ffmpeg is installed (e.g. record :1 with `ffmpeg -f x11grab -i :1 out.mp4`).
   Pages' WebMCP tools: `agent-browser webmcp list` / `webmcp invoke <tool>`.
-- View: VNC :5900 (no password) or noVNC http://<host>:6080/vnc.html through the
-  VM's published ports (wrap: `network.ports: [6080]`; the host side is loopback).
+- agent-desktop (installed too, no download on first use) sees and drives the
+  desktop's apps through AT-SPI: `agent-desktop list-apps`, `snapshot --app
+  <name> -i`, then `click`/`type` with the refs it printed. It needs the
+  accessibility bus on; `wrap-a11y status` says whether it is, and
+  `wrap-desktop start` switches it on (see below).
+- Accessibility: nothing here sets NO_AT_BRIDGE, which would keep GTK from
+  loading the bridge. The bus is switched on by setting
+  org.a11y.Status.IsEnabled after the session bus is up (`wrap-a11y enable`,
+  run by `wrap-desktop start` before XFCE and Chrome). gsettings'
+  toolkit-accessibility is an *output* of that property, so setting it alone
+  does nothing. `wrap-desktop run` also supervises `wrap-a11y watch`, which
+  re-enables the moment a new bus launcher appears, so a launcher that dies
+  mid-session recovers without a login. Chrome is told to publish its web
+  contents with --force-renderer-accessibility, and a page only appears on the
+  tree once a window is open (the dock's icon or `wrap-chrome URL`).
+- No window compositor: xfwm4 runs with use_compositing false, because under a
+  compositor the X root window holds only the compositor's stage, so a
+  whole-screen capture (`wrap-desktop screenshot FILE`, `agent-desktop
+  screenshot --screen 0`) cannot see the real windows. A window that is covered
+  therefore cannot be captured on its own; capture the screen instead.
+- View: voxl, a browser viewer (H.264 over a WebSocket), on :6080 through the
+  VM's published ports (wrap: `network.ports: [6080]`; the host side is
+  loopback). `wrap-desktop url` prints the sign-in link,
+  http://127.0.0.1:6080/?token=<password>. The password is WRAP_DESKTOP_PASSWORD,
+  else /var/lib/wrap-desktop/<uid>/password (made up on the first start, kept
+  after; `wrap-desktop password` prints it).
+  The page decodes with WebCodecs, so open it on localhost/127.0.0.1 or over
+  HTTPS; through an HTTPS proxy, pass its host name with
+  WRAP_DESKTOP_VOXL_ARGS=--allowed-hosts=NAME. Other sites' pages are refused.
+- The viewer's server also answers scripts, with the password as a Bearer token
+  or `curl -u ":$(wrap-desktop password)"`: GET localhost:6080/screenshot (PNG),
+  and /wait, which returns once the screen has been still for `idle` ms (300)
+  or, with `?change`, at the first change: no sleeping after an action.
 EOF
 
 # Anything a root build step may have left in the user's home belongs to user.
@@ -748,5 +1073,5 @@ RUN find "${WRAP_USER_HOME}" \( ! -uid "${WRAP_UID}" -o ! -gid "${WRAP_GID}" \) 
       -exec chown -h "${WRAP_UID}:${WRAP_GID}" {} +
 
 ENV HOME=/home/user USER=user
-EXPOSE 5900 6080 9223
+EXPOSE 6080 9223
 CMD ["/opt/wrap/bin/wrap-desktop", "run"]

@@ -2,8 +2,9 @@
 # wrap's workflow on smolvm, using the Smolfile next to this script.
 #   wrapvm            login zsh in this directory's machine
 #   wrapvm -- CMD...  run CMD there
-# The desktop (noVNC) is published on the host's loopback at $WRAPVM_DESKTOP_PORT
-# (default 6080), chosen when the machine is created.
+# The desktop viewer (voxl) is published on the host's loopback at
+# $WRAPVM_DESKTOP_PORT (default 6080), chosen when the machine is created; the
+# sign-in link is printed on every start.
 # SMOLVM (default smolvm) names the smolvm CLI; WRAPVM_IMAGE overrides the
 # Smolfile's image when the machine is created (a registry ref or ./image.tar).
 set -eu
@@ -30,7 +31,14 @@ if token=$(gh auth token 2>/dev/null) && [ -n "$token" ]; then
   export GH_TOKEN
 fi
 "$smolvm" machine start --name "$name" >&2
-echo "desktop: http://127.0.0.1:$port/vnc.html?autoconnect=1&resize=scale&reconnect=1" >&2
+
+# The viewer's password is made up on the desktop's first start: wait for it.
+i=0
+until link=$("$smolvm" machine exec --name "$name" -u user -- wrap-desktop url "127.0.0.1:$port" 2>/dev/null); do
+  i=$((i + 1)); [ "$i" -lt 60 ] || { link="(not up yet: wrapvm -- wrap-desktop url 127.0.0.1:$port)"; break; }
+  sleep 1
+done
+echo "desktop: $link" >&2
 
 [ "${1:-}" = "--" ] && shift
 [ $# -gt 0 ] || set -- zsh -l

@@ -43,11 +43,24 @@ jobs:
           cache-from: type=gha,scope=wrapvm
           cache-to: type=gha,mode=max,scope=wrapvm
 
-      - name: Test the desktop's accessibility path (agent-desktop, agent-browser)
-        run: docker run --rm -v "$PWD/tests:/tests:ro" localhost/wrapvm:test bash -l /tests/container_desktop_a11y.sh
+      # The same checks as `make test`: wrap's desktop tests, then wrapvm's own.
+      - name: Test mise and agent-browser
+        run: docker run --rm -v "$PWD/tests:/tests:ro" localhost/wrapvm:test bash /tests/container_mise.sh desktop
 
-      - name: Test a plain detached run (CDP, SIGTERM)
+      - name: Test the viewer, offline
+        run: docker run --rm --network none -e MISE_OFFLINE=1 -v "$PWD/tests:/tests:ro" localhost/wrapvm:test bash /tests/container_viewer.sh
+
+      - name: Test both agent CLIs on a fresh HOME, offline
+        run: docker run --rm --network none localhost/wrapvm:test sh -lc 'd=$(mktemp -d); HOME=$d agent-browser --version >/dev/null && HOME=$d agent-desktop version >/dev/null'
+
+      - name: Test accessibility (agent-desktop)
+        run: CONTAINER_ENGINE=docker bash tests/container_a11y_run.sh localhost/wrapvm:test
+
+      - name: Test a plain detached run (CDP, viewer, SIGTERM)
         run: CONTAINER_ENGINE=docker bash tests/container_desktop_run.sh localhost/wrapvm:test
+
+      - name: Test what wrapvm adds (ffmpeg, agent-browser config, skills)
+        run: docker run --rm -v "$PWD/tests:/tests:ro" localhost/wrapvm:test bash -l /tests/container_wrapvm.sh
 
       - name: Log in to GitHub Container Registry
         if: github.event_name != 'pull_request'

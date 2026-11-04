@@ -3,7 +3,9 @@
 - `Containerfile` is the one definition of the VM. `Dockerfile` is a symlink to it; never fork them.
   The `Smolfile` only boots the published image (`ghcr.io/tobi/wrapvm:desktop`): settings that exist only at run
   time (mounts, network policy, credentials, resources) go there, everything about the guest goes in the Containerfile.
+- The Containerfile is tobi/wrap's `Containerfile.desktop` (see the header for the commit) plus blocks marked `wrapvm:`.
+  To take a newer wrap desktop, copy its file and tests over and re-apply only the `wrapvm:` blocks.
 - Scripts are written with `RUN cat > … <<'EOF'`; build with BuildKit or podman, never Docker's legacy builder.
-- Keep agent-desktop working: no `NO_AT_BRIDGE`, `wrap-a11y` before Chrome starts, no xfwm4 compositing.
-  `tests/container_desktop_a11y.sh` is the acceptance test; run `make test` after changing the image.
+- Keep agent-desktop working: no `NO_AT_BRIDGE`, `wrap-a11y` on in `wrap-desktop start`, no xfwm4 compositing.
+  Run `make test` after changing the image.
 - Build steps run as root with `HOME=/root`; nothing may leave root-owned files under `/opt/mise` or `/home/user`.

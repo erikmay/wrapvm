@@ -15,10 +15,15 @@ check-engine:
 image: check-engine
 	$(CONTAINER_ENGINE) build --pull -t $(IMAGE) -f Containerfile .
 
-# Needs egress (agent-browser installs on first use); every container is disposable.
+# wrap's desktop tests (tests/container_{mise,viewer,a11y,desktop}*, from
+# tobi/wrap), then what wrapvm adds. Needs egress; every container is disposable.
 test: image
-	$(CONTAINER_ENGINE) run --rm -v "$(CURDIR)/tests:/tests:ro" $(IMAGE) bash -l /tests/container_desktop_a11y.sh
+	$(CONTAINER_ENGINE) run --rm -v "$(CURDIR)/tests:/tests:ro" $(IMAGE) bash /tests/container_mise.sh desktop
+	$(CONTAINER_ENGINE) run --rm --network none -e MISE_OFFLINE=1 -v "$(CURDIR)/tests:/tests:ro" $(IMAGE) bash /tests/container_viewer.sh
+	$(CONTAINER_ENGINE) run --rm --network none $(IMAGE) sh -lc 'd=$$(mktemp -d); HOME=$$d agent-browser --version >/dev/null && HOME=$$d agent-desktop version >/dev/null'
+	CONTAINER_ENGINE="$(CONTAINER_ENGINE)" bash tests/container_a11y_run.sh $(IMAGE)
 	CONTAINER_ENGINE="$(CONTAINER_ENGINE)" bash tests/container_desktop_run.sh $(IMAGE)
+	$(CONTAINER_ENGINE) run --rm -v "$(CURDIR)/tests:/tests:ro" $(IMAGE) bash -l /tests/container_wrapvm.sh
 
 # A local build for smolvm before CI has published it:
 #   make image.tar && WRAPVM_IMAGE=$PWD/wrapvm.tar ./wrapvm
