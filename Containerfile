@@ -324,7 +324,8 @@ EOF
 # Launcher that every consumer goes through (PATH puts /usr/local/bin first,
 # so it shadows the deb's /usr/bin symlink for the .desktop entry too).
 #  - container-safe flags: no /dev/shm reliance, no first-run, no default check
-#  - root gets --no-sandbox (Chrome refuses to start as uid 0 otherwise).
+#  - root gets --no-sandbox (Chrome refuses to start as uid 0 otherwise), and
+#    so does a runtime that refuses Chrome's namespaces (see below).
 #  - user flags, one per line, from ~/.config/chrome-flags.conf (Arch's
 #    google-chrome convention), else /etc/wrap/chrome-flags.conf. They apply to
 #    every launch: the shared desktop Chrome, the dock, and any Chrome that
@@ -346,11 +347,17 @@ while [ "$n" -gt 0 ]; do a=$1; shift; set -- "$@" "$a"; n=$((n - 1)); done
 # Chromium leaves renderer accessibility off until an assistive technology is
 # detected, which on this image nothing does; agent-desktop reads desktop apps
 # through that tree (wrap-a11y switches the bus on).
-set -- --disable-dev-shm-usage --no-first-run --no-default-browser-check \
-       --password-store=basic --force-renderer-accessibility "$@"
-if [ "$(id -u)" = 0 ]; then
+# wrapvm: --no-sandbox only where Chrome cannot have a sandbox: as root, or
+# where the user, PID and network namespaces it needs are refused (Docker's
+# default seccomp profile; Chrome then dies with "failed to move to new
+# namespaces"). smolvm, podman and docker --security-opt seccomp=unconfined
+# allow them, so Chrome keeps its sandbox there. It goes after the fixed flags:
+# what looks for the browser process matches on --disable-dev-shm-usage first.
+if [ "$(id -u)" = 0 ] || ! unshare --user --map-root-user --pid --net --fork true 2>/dev/null; then
   set -- --no-sandbox "$@"
 fi
+set -- --disable-dev-shm-usage --no-first-run --no-default-browser-check \
+       --password-store=basic --force-renderer-accessibility "$@"
 exec /opt/google/chrome/google-chrome "$@"
 EOF
 # wrapvm: no --no-sandbox here; Chrome keeps its sandbox.

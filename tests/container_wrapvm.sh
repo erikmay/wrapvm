@@ -39,8 +39,13 @@ ok 'agent-browser, with the default config, opens its page in the desktop Chrome
 
 chrome="$(ps -eo args | grep -E '^/opt/google/chrome/chrome( |$)' | grep -v -- '--type=' | head -1)"
 [ -n "$chrome" ]
-case "$chrome" in *--no-sandbox*) echo "Chrome runs without its sandbox: $chrome" >&2; exit 1 ;; esac
-ok 'the desktop Chrome runs with its sandbox'
+if unshare --user --map-root-user --pid --net --fork true 2>/dev/null; then
+  case "$chrome" in *--no-sandbox*) echo "Chrome runs without its sandbox: $chrome" >&2; exit 1 ;; esac
+  ok 'the desktop Chrome runs with its sandbox'
+else
+  case "$chrome" in *--no-sandbox*) ;; *) echo "no namespaces, yet no --no-sandbox: $chrome" >&2; exit 1 ;; esac
+  ok 'this runtime refuses Chrome'"'"'s namespaces (plain Docker), so it runs with --no-sandbox'
+fi
 
 test "$(xdg-mime query default x-scheme-handler/https)" = wrap-chrome.desktop
 test "$(xdg-settings get default-web-browser)" = wrap-chrome.desktop
