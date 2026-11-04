@@ -7,6 +7,8 @@
 # sign-in link is printed on every start.
 # SMOLVM (default smolvm) names the smolvm CLI; WRAPVM_IMAGE overrides the
 # Smolfile's image when the machine is created (a registry ref or ./image.tar).
+# WRAP_DESKTOP_VOXL_ARGS, set at create, reaches the viewer (e.g.
+# --allowed-hosts=NAME behind an HTTPS proxy such as tailscale serve).
 set -eu
 here=$(dirname "$(readlink -f "$0")")
 smolvm="${SMOLVM:-smolvm}"
@@ -20,6 +22,7 @@ if ! "$smolvm" machine status --name "$name" >/dev/null 2>&1; then
   ( # a subshell, so the caller's arguments survive
     set -- machine create --name "$name" -s "$here/Smolfile" -p "$port:6080"
     [ -z "${WRAPVM_IMAGE:-}" ] || set -- "$@" --image "$WRAPVM_IMAGE"
+    [ -z "${WRAP_DESKTOP_VOXL_ARGS:-}" ] || set -- "$@" -e "WRAP_DESKTOP_VOXL_ARGS=$WRAP_DESKTOP_VOXL_ARGS"
     exec "$smolvm" "$@" >/dev/null
   )
 fi
