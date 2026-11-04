@@ -4,10 +4,10 @@
 # attach to that Chrome — so a human (via VNC) and the agent share the same
 # browser — and agent-desktop, which sees and drives the desktop's apps through
 # the AT-SPI accessibility tree. This file is the one definition of the VM:
-# CI publishes it as ghcr.io/tobi/wrapvm, and the Smolfile boots that image.
+# CI publishes it as ghcr.io/tobi/wrapvm:desktop, which the Smolfile boots.
 #
-#   docker run -d ghcr.io/tobi/wrapvm                    # desktop + chrome up
-#   docker run -it ghcr.io/tobi/wrapvm                   # shell, desktop autostarts
+#   docker run -d ghcr.io/tobi/wrapvm:desktop            # desktop + chrome up
+#   docker run -it ghcr.io/tobi/wrapvm:desktop           # shell, desktop autostarts
 #   -e WRAP_DESKTOP_AUTOSTART=0                          # opt out of autostart
 #
 # VNC :5900 and noVNC :6080 listen on all guest interfaces so the VM/container

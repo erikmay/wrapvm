@@ -16,7 +16,7 @@ prototype `697ef58`). wrap keeps the CLI and the base image; this repo is the de
 
 | File | What |
 | --- | --- |
-| `Containerfile` | The VM. CI builds it, tests it and publishes `ghcr.io/tobi/wrapvm` |
+| `Containerfile` | The VM. CI builds it, tests it and publishes `ghcr.io/tobi/wrapvm:desktop` (also `:latest`) |
 | `Dockerfile` | A symlink to `Containerfile`, for `docker build .` |
 | `Smolfile` | A smolvm machine booting that image, with the workspace mount, network policy and credentials |
 | `wrapvm` | One machine per directory: create, start, shell in (`wrapvm -- CMD` runs CMD) |
@@ -26,7 +26,7 @@ prototype `697ef58`). wrap keeps the CLI and the base image; this repo is the de
 
 ```sh
 ./wrapvm                                  # smolvm: machine for $PWD, zsh in it; prints the desktop URL
-docker run -d -p 127.0.0.1:6080:6080 ghcr.io/tobi/wrapvm    # or as a container
+docker run -d -p 127.0.0.1:6080:6080 ghcr.io/tobi/wrapvm:desktop   # or as a container
 ```
 
 The desktop is `http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=scale` (`WRAPVM_DESKTOP_PORT`

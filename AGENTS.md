@@ -1,7 +1,7 @@
 # wrapvm
 
 - `Containerfile` is the one definition of the VM. `Dockerfile` is a symlink to it; never fork them.
-  The `Smolfile` only boots the published image (`ghcr.io/tobi/wrapvm`): settings that exist only at run
+  The `Smolfile` only boots the published image (`ghcr.io/tobi/wrapvm:desktop`): settings that exist only at run
   time (mounts, network policy, credentials, resources) go there, everything about the guest goes in the Containerfile.
 - Scripts are written with `RUN cat > … <<'EOF'`; build with BuildKit or podman, never Docker's legacy builder.
 - Keep agent-desktop working: no `NO_AT_BRIDGE`, `wrap-a11y` before Chrome starts, no xfwm4 compositing.
