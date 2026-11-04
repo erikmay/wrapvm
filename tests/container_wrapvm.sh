@@ -19,6 +19,11 @@ sudo -n -i true   # a root login shell writes it too, owned by the workspace's u
 test "$(stat -c %u "$AGENT_BROWSER_CONFIG")" = "$(id -u)"
 ok 'AGENT_BROWSER_CONFIG gets its default once, never over a changed one'
 
+if [ -d /run/smolvm ]; then kind=vm; else kind=container; fi
+zsh -c 'starship prompt' | grep -q "\[$kind:$(uname -n)\]"
+bash -lc 'starship prompt' | grep -q "\[$kind:$(uname -n)\]"
+ok "the prompt says [$kind:$(uname -n)]"
+
 for skill in desktop browser; do
   head -3 "$HOME/.agents/skills/$skill/SKILL.md" | grep -qx "name: $skill"
 done
@@ -31,3 +36,28 @@ echo '<title>agent-browser page</title>' > "$page/ab.html"
 agent-browser open "file://$page/ab.html" >/dev/null
 curl -fsS http://127.0.0.1:9222/json/list | jq -e '[.[].title] | index("agent-browser page")' >/dev/null
 ok 'agent-browser, with the default config, opens its page in the desktop Chrome'
+
+chrome="$(ps -eo args | grep -E '^/opt/google/chrome/chrome( |$)' | grep -v -- '--type=' | head -1)"
+[ -n "$chrome" ]
+case "$chrome" in *--no-sandbox*) echo "Chrome runs without its sandbox: $chrome" >&2; exit 1 ;; esac
+ok 'the desktop Chrome runs with its sandbox'
+
+test "$(xdg-mime query default x-scheme-handler/https)" = wrap-chrome.desktop
+test "$(xdg-settings get default-web-browser)" = wrap-chrome.desktop
+test "$BROWSER" = wrap-chrome
+in_chrome() { curl -fsS http://127.0.0.1:9222/json/list | jq -e --arg t "$1" '[.[].title] | index($t)' >/dev/null; }
+echo '<title>xdg-open page</title>' > "$page/xdg.html"
+xdg-open "file://$page/xdg.html"
+echo '<title>exo page</title>' > "$page/exo.html"
+exo-open --launch WebBrowser "file://$page/exo.html"
+for _ in $(seq 20); do in_chrome 'xdg-open page' && in_chrome 'exo page' && break; sleep 0.5; done
+in_chrome 'xdg-open page' && in_chrome 'exo page'
+ok 'Chrome is the default browser: xdg-open and XFCE open links as tabs in the shared Chrome'
+
+# The tone goes ALSA default -> pulseaudio-alsa -> the desktop's null sink.
+ffmpeg -hide_banner -loglevel error -f lavfi -i sine=d=0.2 -f alsa default
+test "$(pactl get-default-sink)" = output
+if grep -E 'ALSA lib|PcmOpen' "/tmp/wrap-desktop-$(id -u)/desktop.log"; then
+  echo "something failed to open audio" >&2; exit 1
+fi
+ok "ALSA plays into the desktop's PulseAudio sink; nothing logs an ALSA error"

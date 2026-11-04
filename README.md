@@ -8,7 +8,10 @@ A desktop VM for agents: [wrap](https://github.com/tobi/wrap)'s desktop image, a
 - [agent-browser](https://github.com/vercel-labs/agent-browser) for browser use, attached to that Chrome
 - [agent-desktop](https://github.com/vercel-labs/agent-desktop) for computer use, through AT-SPI
 - `desktop` and `browser` skills in `~/.agents/skills`, pointing agents at those two CLIs' own guides
+- sound: PulseAudio with a null sink, streamed by the viewer and recordable with ffmpeg
+- the shared Chrome as the default browser (xdg-open, XFCE, `$BROWSER`), with its sandbox on
 - ffmpeg
+- a prompt that says `[vm:<machine>]` under smolvm, `[container:<host>]` in a container
 
 The `Containerfile` is tobi/wrap's `Containerfile.desktop` at `c562a7d`, plus what wrapvm adds (each block is
 marked `wrapvm:`). wrap keeps the CLI and the base image (`ghcr.io/tobi/wrap:latest`, the `FROM` here).

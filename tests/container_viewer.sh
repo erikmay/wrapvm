@@ -8,6 +8,7 @@
 #   - a socket from another site's page is refused, the viewer's own is not;
 #   - the socket carries H.264 starting at a keyframe, and input sent over it
 #     moves the desktop's pointer;
+#   - (wrapvm) desktop sound reaches it as Opus;
 #   - the image's own Chrome decodes that stream (WebCodecs);
 #   - a viewer that died comes back with the same password on the next start,
 #     and WRAP_DESKTOP_PASSWORD chooses another.
@@ -180,7 +181,7 @@ check(op == 0x1, "the first message is not the hello")
 hello = json.loads(data)
 check(hello.get("t") == "hello" and (hello.get("w"), hello.get("h")) == (1280, 800),
       f"hello: {hello}")
-check(hello.get("audio") is False, "audio is on, but no sound server runs")
+check(hello.get("audio") is True, "the viewer offers no audio (is the sound server up?)")
 
 # Video on: the stream starts at a keyframe. Type 0x01, flags bit 0 = key,
 # a 16-byte header, then Annex-B H.264 (see voxl's web/src/protocol.ts).
@@ -206,6 +207,23 @@ while True:
     check(time.time() < deadline, f"the pointer did not move: {where}")
     time.sleep(0.1)
 print("ok - a pointer move sent over the socket moves the desktop's pointer")
+
+# wrapvm: sound. A tone played into the desktop's default ALSA device (through
+# pulseaudio-alsa into the null sink) arrives on the socket as Opus (type 0x02).
+send(s, "v,0")
+send(s, "au,1")
+tone = subprocess.Popen(["ffmpeg", "-hide_banner", "-loglevel", "error", "-re", "-f", "lavfi",
+                         "-i", "sine=frequency=440:duration=10", "-f", "alsa", "default"])
+deadline = time.time() + 10
+try:
+    while True:
+        check(time.time() < deadline, "no Opus audio on the socket within 10s of a tone")
+        op, data = r.message()
+        if op == 0x2 and data[:1] == b"\x02":
+            break
+finally:
+    tone.kill()
+print("ok - desktop sound reaches the viewer as Opus")
 s.close()
 PY
 

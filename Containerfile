@@ -99,8 +99,9 @@ ENV DISPLAY=:1 \
 # X + XFCE + viewer + Chrome runtime deps (Arch repos). XFCE is assembled from
 # components rather than the `xfce4` group to skip power-manager, screensaver,
 # pulseaudio plugin and friends — nothing here should ever lock or dim :1.
-# x264, libyuv, opus and libpulse are what the voxl binary links (libpulse is
-# the client library only; no sound server runs, so voxl's audio is off).
+# x264, libyuv, opus and libpulse are what the voxl binary links.
+# wrapvm: pulseaudio is the desktop's sound card, a null sink that voxl streams
+# to the viewer; pulseaudio-alsa routes ALSA's default device into it.
 # ---------------------------------------------------------------------------
 RUN pacman -Syu --noconfirm --needed \
       xorg-server-xvfb xorg-xauth xorg-xdpyinfo xorg-xset xorg-xrandr xdotool \
@@ -111,7 +112,7 @@ RUN pacman -Syu --noconfirm --needed \
       alsa-lib gtk3 libcups libxss libxtst nss xdg-utils at-spi2-core \
       libxrandr libxcomposite libxdamage libxkbcommon libdrm mesa pango cairo \
       libxshmfence vulkan-icd-loader \
-      ffmpeg \
+      ffmpeg pulseaudio pulseaudio-alsa \
  && dbus-uuidgen --ensure=/etc/machine-id \
  && rm -rf /var/cache/pacman/pkg/*
 
@@ -352,10 +353,7 @@ if [ "$(id -u)" = 0 ]; then
 fi
 exec /opt/google/chrome/google-chrome "$@"
 EOF
-# Chrome's sandbox needs unprivileged user+pid+net namespaces, which Docker's
-# default seccomp profile refuses (Chrome then aborts: zygote "Failed to move to
-# new namespace"), so the default drops it. Remove --no-sandbox under a runtime
-# that allows them (microVMs, `--security-opt seccomp=unconfined`).
+# wrapvm: no --no-sandbox here; Chrome keeps its sandbox.
 # Chrome honors only the last --enable-features: keep both WebMCP features in
 # any replacement line, or agent-browser's `webmcp` commands find no tools.
 # The page API is the WebMCP feature. Chrome 157 removed WebMCPTesting, which
@@ -363,7 +361,6 @@ EOF
 RUN cat > /etc/wrap/chrome-flags.conf <<'EOF'
 # Extra Google Chrome flags, one per line. Copy to ~/.config/chrome-flags.conf
 # to change them; restart Chrome with `wrap-desktop stop && wrap-desktop start`.
---no-sandbox
 # WebMCP: pages register tools on document.modelContext; agent-browser lists
 # and calls them with `agent-browser webmcp list|invoke`.
 --enable-features=WebMCP,DevToolsWebMCPSupport
@@ -461,6 +458,63 @@ RUN v="$(sudo -u "${WRAP_USER_NAME}" -H sh -lc 'agent-browser --version' | awk '
       | bsdtar -x -C /opt/agent-browser --strip-components 1 "agent-browser-$v/skill-data" \
  && chmod -R a+rX /opt/agent-browser \
  && sudo -u "${WRAP_USER_NAME}" -H env AGENT_BROWSER_SKILLS_DIR="$AGENT_BROWSER_SKILLS_DIR" sh -lc 'agent-browser skills get core' | head -3 | grep -qx 'name: core'
+
+# wrapvm: the desktop's sound. No hardware: one PulseAudio server per desktop,
+# started by wrap-desktop as the desktop's uid, whose only sink is a null one
+# named `output`. Chrome, ffmpeg and ALSA apps (through pulseaudio-alsa) play
+# into it; voxl streams its monitor, output.monitor, to the viewer, and
+# `ffmpeg -f pulse -i output.monitor` records it. The socket is
+# $XDG_RUNTIME_DIR/pulse/native, in a 0700 directory: any process of that uid
+# may play, whatever its HOME (so no cookie).
+RUN cat > /etc/wrap/pulse.pa <<'EOF'
+load-module module-native-protocol-unix auth-anonymous=1
+load-module module-null-sink sink_name=output sink_properties=device.description=Desktop
+set-default-sink output
+set-default-source output.monitor
+EOF
+# Clients find that server whatever their environment (a shell without
+# XDG_RUNTIME_DIR, root), and never spawn a second, sinkless one of their own.
+RUN install -d /etc/pulse/client.conf.d \
+ && printf '%s\n' 'autospawn = no' \
+      "default-server = unix:/tmp/wrap-desktop-${WRAP_UID}/runtime/pulse/native" \
+      > /etc/pulse/client.conf.d/50-wrapvm.conf
+
+# wrapvm: the shared desktop Chrome is the default browser, for everything
+# that opens a link: xdg-open, gio, GTK apps (mimeapps.list), XFCE's own
+# launchers (exo's WebBrowser helper) and CLI tools that read $BROWSER. All
+# of them go through wrap-chrome, so a link opens as a tab in the Chrome that
+# agent-browser and the person share, never in a second profile.
+ENV BROWSER=wrap-chrome
+RUN cat > /etc/xdg/mimeapps.list <<'EOF'
+[Default Applications]
+x-scheme-handler/http=wrap-chrome.desktop
+x-scheme-handler/https=wrap-chrome.desktop
+x-scheme-handler/about=wrap-chrome.desktop
+x-scheme-handler/unknown=wrap-chrome.desktop
+text/html=wrap-chrome.desktop
+application/xhtml+xml=wrap-chrome.desktop
+application/pdf=wrap-chrome.desktop
+EOF
+RUN install -d /etc/xdg/xfce4 \
+ && printf '%s\n' 'WebBrowser=wrap-chrome' > /etc/xdg/xfce4/helpers.rc \
+ && cat > /usr/share/xfce4/helpers/wrap-chrome.desktop <<'EOF'
+[Desktop Entry]
+NoDisplay=true
+Version=1.0
+Type=X-XFCE-Helper
+X-XFCE-Category=WebBrowser
+X-XFCE-Commands=wrap-chrome
+X-XFCE-CommandsWithParameter=wrap-chrome "%s"
+Icon=google-chrome
+Name=Google Chrome (shared desktop)
+EOF
+
+# wrapvm: the prompt says [vm:<machine>] under smolvm, [container:<host>] in a
+# container. smolvm's guest init leaves /run/smolvm; zshenv and login shells
+# both source wrap.sh, so the choice is made there.
+RUN sed 's/container:\$hostname/vm:\$hostname/' /etc/wrap/starship.toml > /etc/wrap/starship-vm.toml \
+ && grep -q 'vm:\$hostname' /etc/wrap/starship-vm.toml \
+ && printf '%s\n' '[ -d /run/smolvm ] && export STARSHIP_CONFIG=/etc/wrap/starship-vm.toml' >> /etc/profile.d/wrap.sh
 
 # wrapvm: the desktop and browser skills, global for agents (pi, Claude Code,
 # Codex read ~/.agents/skills). Seeded into /etc/skel and both existing homes;
@@ -794,6 +848,7 @@ trust_local_cas() {
       && say "chrome trusts $ca"
   done
 }
+pulse_up() { pactl info >/dev/null 2>&1; }
 cdp_up() { curl -fsS -m 1 "http://127.0.0.1:$WRAP_DESKTOP_CDP_PORT/json/version" >/dev/null 2>&1; }
 viewer_on() { case "$WRAP_DESKTOP_VIEWER_PORT" in ''|0) return 1 ;; esac; }
 viewer_up() { curl -fsS -m 1 -o /dev/null "http://127.0.0.1:$WRAP_DESKTOP_VIEWER_PORT/healthz" 2>/dev/null; }
@@ -836,8 +891,8 @@ ensure_password() {
 
 # voxl on every guest interface (the port publish targets the guest NIC). The
 # password reaches it through its environment, which only its own uid can read,
-# never through argv, which any uid sees in ps. Audio is off: no sound server
-# runs here. WRAP_DESKTOP_VOXL_ARGS adds flags, e.g. --allowed-hosts=NAME to
+# never through argv, which any uid sees in ps. Audio is the PulseAudio sink's
+# monitor (voxl's default output.monitor). WRAP_DESKTOP_VOXL_ARGS adds flags, e.g. --allowed-hosts=NAME to
 # answer for a proxy's host name, or --read-only.
 start_viewer() {
   ensure_password || { say "viewer: cannot keep a password in $(password_file)"; return 1; }
@@ -848,7 +903,7 @@ start_viewer() {
     export VOXL_PASSWORD="$pw"
     # shellcheck disable=SC2086 # a list of flags, split on purpose
     spawn viewer voxl --addr=0.0.0.0 --port="$WRAP_DESKTOP_VIEWER_PORT" \
-      --audio-enabled=false --title="$title" $WRAP_DESKTOP_VOXL_ARGS
+      --title="$title" $WRAP_DESKTOP_VOXL_ARGS
   )
 }
 
@@ -909,6 +964,18 @@ start() {
     say "desktop up on $DISPLAY ($WRAP_DESKTOP_GEOMETRY)"
   fi
   /opt/wrap/bin/wrap-agent-browser-config
+  # Sound, before the viewer and Chrome connect to it; the owner's only, as
+  # accessibility is.
+  if owns_desktop && ! pulse_up; then
+    rm -f "$run_dir/pulse.pid"
+    spawn pulse pulseaudio -n -F /etc/wrap/pulse.pa --daemonize=no --use-pid-file=no \
+      --exit-idle-time=-1 --log-target=stderr
+    i=0
+    until pulse_up; do
+      i=$((i + 1)); [ "$i" -lt 50 ] || { say "sound server did not come up (see $log)"; break; }
+      sleep 0.1
+    done
+  fi
   # The viewer streams this uid's desktop; another uid's `start` (a `sudo -i`
   # login shell) leaves it to the owner, as it does accessibility.
   if viewer_on && owns_desktop; then
@@ -1005,6 +1072,7 @@ if [ "${WRAP_DESKTOP_AUTOSTART:-1}" = 1 ] && [ -x /opt/wrap/bin/wrap-desktop ]; 
 fi
 export AGENT_BROWSER_CONFIG="${AGENT_BROWSER_CONFIG:-/home/user/workspace/agent-browser.json}"
 export AGENT_BROWSER_SKILLS_DIR="${AGENT_BROWSER_SKILLS_DIR:-/opt/agent-browser/skill-data}"
+export BROWSER="${BROWSER:-wrap-chrome}"
 /opt/wrap/bin/wrap-agent-browser-config 2>/dev/null || true
 EOF
 
@@ -1020,7 +1088,7 @@ RUN cat > /etc/wrap/desktop.md <<'EOF'
 - One persistent Google Chrome on that desktop (no window until something opens
   one; the dock's Chrome icon opens a window in the same instance), CDP on
   127.0.0.1:9222 (and :9223 on guest interfaces for publishing), profile in
-  ~/.config/wrap-chrome. Launch flags (default --no-sandbox and WebMCP) come
+  ~/.config/wrap-chrome. Launch flags (default: WebMCP) come
   from ~/.config/chrome-flags.conf, else /etc/wrap/chrome-flags.conf. First-run, sign-in, sync, default-browser,
   privacy-sandbox, keyring and promo prompts are disabled via managed policies in
   /etc/opt/chrome/policies/managed and /opt/google/chrome/initial_preferences.
@@ -1031,6 +1099,10 @@ RUN cat > /etc/wrap/desktop.md <<'EOF'
   hand back). Edit that file per workspace; it replaces ~/.agent-browser/config.json.
   `agent-browser doctor` verifies.
 - ffmpeg is installed (e.g. record :1 with `ffmpeg -f x11grab -i :1 out.mp4`).
+- Sound: a PulseAudio server per desktop with one null sink, `output`; ALSA's default
+  device plays into it, the viewer streams it, `ffmpeg -f pulse -i output.monitor` records it.
+- The shared Chrome is the default browser: xdg-open, XFCE and $BROWSER open links
+  as tabs in it (wrap-chrome).
   Pages' WebMCP tools: `agent-browser webmcp list` / `webmcp invoke <tool>`.
 - agent-desktop (installed too, no download on first use) sees and drives the
   desktop's apps through AT-SPI: `agent-desktop list-apps`, `snapshot --app
