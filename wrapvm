@@ -2,9 +2,10 @@
 # wrap's workflow on smolvm, using the Smolfile next to this script.
 #   wrapvm            login zsh in this directory's machine
 #   wrapvm -- CMD...  run CMD there
-# The desktop viewer (voxl) is published on the host's loopback at
-# $WRAPVM_DESKTOP_PORT (default 6080), chosen when the machine is created; the
-# sign-in link is printed on every start.
+# The desktop viewer (voxl) is published on the host's loopback at a port chosen
+# when the machine is created: $WRAPVM_DESKTOP_PORT, else the first port from
+# 6080 up that no other machine holds and nothing listens on. The sign-in link
+# is printed on every start. `wrapvm-watch` shows every machine on one page.
 # SMOLVM (default smolvm) names the smolvm CLI; WRAPVM_IMAGE overrides the
 # Smolfile's image when the machine is created (a registry ref or ./image.tar).
 # WRAP_DESKTOP_VOXL_ARGS, set at create, reaches the viewer (e.g.
@@ -12,13 +13,42 @@
 set -eu
 here=$(dirname "$(readlink -f "$0")")
 smolvm="${SMOLVM:-smolvm}"
-port="${WRAPVM_DESKTOP_PORT:-6080}"
 dir=$(pwd -P)
 base=$(basename "$dir" | tr -cs 'A-Za-z0-9' '-' | cut -c1-40 | sed 's/^-*//; s/-*$//')
 name="${base:-wrapvm}-$(printf %s "$dir" | cksum | cut -c1-6)"
 
+# The host port a machine publishes the viewer (guest 6080) on: its
+# wrapvm.port label, set at create (kept while stopped), else, for a machine
+# made before the label, the running machine's configuration in its data dir.
+machine_port() {
+  p=$("$smolvm" machine status --name "$1" --json 2>/dev/null \
+    | sed -n 's/^ *"wrapvm\.port": "\([0-9]*\)",*$/\1/p' | head -n 1)
+  if [ -z "$p" ] && d=$("$smolvm" machine data-dir --name "$1" 2>/dev/null); then
+    p=$(sed -n 's/.*"host":\([0-9]*\),"guest":6080.*/\1/p' "$d/agent.config.json" 2>/dev/null | head -n 1)
+  fi
+  echo "$p"
+}
+
+# A port for a new machine: one no machine holds, running or stopped, and
+# nothing on this host listens on.
+free_port() {
+  held=" "
+  for m in $("$smolvm" machine ls --json 2>/dev/null | sed -n 's/^ *"name": "\(.*\)",$/\1/p'); do
+    held="$held$(machine_port "$m") "
+  done
+  p=6080
+  while case "$held" in *" $p "*) true ;; *) nc -z 127.0.0.1 "$p" 2>/dev/null ;; esac; do
+    p=$((p + 1))
+  done
+  echo "$p"
+}
+
 # One machine per directory; it mounts the directory it was created from.
-if ! "$smolvm" machine status --name "$name" >/dev/null 2>&1; then
+if "$smolvm" machine status --name "$name" >/dev/null 2>&1; then
+  port=$(machine_port "$name")
+  port="${port:-${WRAPVM_DESKTOP_PORT:-6080}}"
+else
+  port="${WRAPVM_DESKTOP_PORT:-$(free_port)}"
   ( # a subshell, so the caller's arguments survive
     # WRAP_UID/WRAP_GID: the Smolfile's init gives the guest `user` these ids,
     # so the workspace mount (owned by this host user) is writable in the guest.

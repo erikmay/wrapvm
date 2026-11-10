@@ -42,7 +42,8 @@ docker run -d -p 127.0.0.1:6080:6080 ghcr.io/erikmay/wrapvm:desktop   # or as a 
 docker exec <id> wrap-desktop url         # its sign-in link
 ```
 
-`WRAPVM_DESKTOP_PORT` picks another host port when `wrapvm` creates the machine.
+Each machine gets its own viewer port when `wrapvm` creates it: the first from 6080 up that no other machine
+holds and nothing listens on (`WRAPVM_DESKTOP_PORT` picks one). It keeps that port across restarts.
 
 The guest `user` takes your host uid and gid on the machine's first start (`wrap-realign`, run by the
 Smolfile's init with the `WRAP_UID`/`WRAP_GID` that `wrapvm` passes at create), so the mounted workspace is
@@ -58,7 +59,7 @@ One tile per wrapvm machine: a live picture of its desktop, its folder, guest CP
 memory its VM holds. A click opens the interactive viewer. As a watchdog it marks a desktop whose viewer stops
 answering and, after `WRAPVM_WATCH_HEAL_SECONDS` (30; 0 turns it off), runs `wrap-desktop start` in it. It
 listens on loopback only and answers only pages served from 127.0.0.1 or localhost. It needs Python 3 and
-`smolvm`. Give each machine its own port: `WRAPVM_DESKTOP_PORT` when `wrapvm` creates it.
+`smolvm`.
 
 ## agent-browser config
 
