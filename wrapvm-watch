@@ -15,6 +15,10 @@ marked down, and after WRAPVM_WATCH_HEAL_SECONDS (default 30, 0 turns it off)
 `wrap-desktop start` is run in it, which brings the desktop back.
 
 Only the Python standard library and the smolvm CLI ($SMOLVM) are used.
+
+On macOS, `./wrapvm-watch --install` runs it as a LaunchAgent: it starts at
+login and comes back if it exits (log: ~/Library/Logs/wrapvm-watch.log).
+`./wrapvm-watch --uninstall` removes it. The agent runs this file where it is.
 """
 import base64
 import http.server
@@ -325,7 +329,58 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
 
+LABEL = "dev.wrapvm.watch"
+PLIST = os.path.expanduser(f"~/Library/LaunchAgents/{LABEL}.plist")
+
+
+def launchctl(*args):
+    return subprocess.run(["launchctl", *args], capture_output=True, text=True)
+
+
+def install():
+    import plistlib
+    import shutil
+    smolvm = shutil.which(SMOLVM)
+    if not smolvm:
+        sys.exit(f"wrapvm-watch: {SMOLVM} is not on PATH")
+    env = {"PATH": f"{os.path.dirname(smolvm)}:/usr/bin:/bin:/usr/sbin:/sbin"}
+    for k in ("WRAPVM_WATCH_PORT", "WRAPVM_WATCH_HEAL_SECONDS", "SMOLVM"):
+        if k in os.environ:
+            env[k] = os.environ[k]
+    log = os.path.expanduser("~/Library/Logs/wrapvm-watch.log")
+    plist = {
+        "Label": LABEL,
+        "ProgramArguments": [sys.executable, os.path.abspath(__file__)],
+        "EnvironmentVariables": env,
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "StandardOutPath": log,
+        "StandardErrorPath": log,
+    }
+    os.makedirs(os.path.dirname(PLIST), exist_ok=True)
+    launchctl("bootout", f"gui/{os.getuid()}/{LABEL}")
+    with open(PLIST, "wb") as f:
+        plistlib.dump(plist, f)
+    r = launchctl("bootstrap", f"gui/{os.getuid()}", PLIST)
+    if r.returncode != 0:
+        sys.exit(f"wrapvm-watch: launchctl bootstrap failed: {r.stderr.strip()}")
+    print(f"wrapvm-watch: installed ({PLIST}); http://127.0.0.1:{PORT}/, log {log}")
+
+
+def uninstall():
+    launchctl("bootout", f"gui/{os.getuid()}/{LABEL}")
+    if os.path.exists(PLIST):
+        os.remove(PLIST)
+    print("wrapvm-watch: uninstalled")
+
+
 def main():
+    if sys.argv[1:] == ["--install"]:
+        return install()
+    if sys.argv[1:] == ["--uninstall"]:
+        return uninstall()
+    if sys.argv[1:]:
+        sys.exit("usage: wrapvm-watch [--install | --uninstall]")
     threading.Thread(target=poll, daemon=True).start()
     srv = Server((LISTEN, PORT), Handler)
     print(f"wrapvm-watch: http://127.0.0.1:{PORT}/", file=sys.stderr)

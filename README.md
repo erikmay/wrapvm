@@ -53,6 +53,8 @@ writable inside and new files are yours on the host. On macOS that is 501:20; th
 
 ```sh
 ./wrapvm-watch                            # http://127.0.0.1:6060/ (WRAPVM_WATCH_PORT picks another)
+./wrapvm-watch --install                  # macOS: a LaunchAgent, up at login and after a crash
+./wrapvm-watch --uninstall
 ```
 
 One tile per wrapvm machine: a live picture of its desktop, its folder, guest CPU and memory, and the host
