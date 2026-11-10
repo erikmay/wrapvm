@@ -554,6 +554,8 @@ RUN for home in /etc/skel /root /home/user; do \
 # XFCE look: no top bar, one centered bottom dock with three launchers
 # (Chrome / Thunar / Terminal) on a transparent panel, solid navy backdrop,
 # no desktop icons or right-click menu, nothing that can lock or prompt.
+# wrapvm: the dock hides itself (autohide-behavior 2, always) and slides in when
+# the pointer reaches the bottom edge, so windows get the whole screen.
 # Seeded into /etc/skel and both existing homes so the first start is final.
 RUN install -d /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml \
       /etc/skel/.config/xfce4/panel/launcher-1 \
@@ -575,7 +577,7 @@ RUN install -d /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml \
       <property name="length" type="uint" value="1"/>
       <property name="size" type="uint" value="64"/>
       <property name="icon-size" type="uint" value="48"/>
-      <property name="autohide-behavior" type="uint" value="0"/>
+      <property name="autohide-behavior" type="uint" value="2"/>
       <property name="background-style" type="uint" value="1"/>
       <property name="background-rgba" type="array">
         <value type="double" value="0"/>
