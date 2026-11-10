@@ -1,9 +1,17 @@
 name: Image
 
-# Builds ./Containerfile, tests it, and publishes ghcr.io/<owner>/wrapvm, which
-# the Smolfile boots. Rebuilt weekly and on demand so a new wrap base image
-# (ghcr.io/tobi/wrap:latest) reaches the VM without a commit here; tobi/wrap can
-# also send a repository_dispatch of type `base-image` after it publishes.
+# Builds ./Containerfile for amd64 and arm64, each on a native runner, tests
+# both, and publishes ghcr.io/<owner>/wrapvm as one multi-arch tag, which the
+# Smolfile boots. smolvm pulls the host's own architecture, so an Apple Silicon
+# Mac runs the arm64 image natively (no Rosetta).
+#
+# amd64 builds on ghcr.io/tobi/wrap:latest. tobi/wrap publishes no arm64 base,
+# so the arm64 job first builds wrap's Containerfile.arm64 (Arch Linux ARM) at
+# WRAP_REV, the commit the Containerfile's desktop half comes from.
+#
+# Rebuilt weekly and on demand so a new wrap base reaches the VM without a
+# commit here; tobi/wrap can also send a repository_dispatch of type
+# `base-image` after it publishes.
 on:
   push:
     branches: [main]
@@ -21,27 +29,41 @@ permissions:
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
+  WRAP_REV: c562a7d2d2dd96600641ffad4c52297ab3bb345a
 
 jobs:
   image:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
-      # BuildKit: the Containerfile writes its scripts with RUN heredocs, which
-      # Docker's legacy builder turns into empty files.
-      - uses: docker/setup-buildx-action@v3
+      # The runner's own Docker engine builds with BuildKit (the Containerfile
+      # writes its scripts with RUN heredocs) and sees images it built before,
+      # which the arm64 build needs for its locally built base.
+      - name: Build the arm64 base (tobi/wrap Containerfile.arm64)
+        if: matrix.arch == 'arm64'
+        run: |
+          docker build --platform linux/arm64 -t localhost/wrap:arm64 -f Containerfile.arm64 \
+            "https://github.com/tobi/wrap.git#${WRAP_REV}"
 
       - name: Build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Containerfile
-          load: true
-          pull: true
-          tags: localhost/wrapvm:test
-          cache-from: type=gha,scope=wrapvm
-          cache-to: type=gha,mode=max,scope=wrapvm
+        run: |
+          if [ "${{ matrix.arch }}" = arm64 ]; then
+            base=localhost/wrap:arm64; pull=
+          else
+            base=ghcr.io/tobi/wrap:latest; pull=--pull
+          fi
+          docker build $pull --platform "linux/${{ matrix.arch }}" --build-arg "BASE_IMAGE=$base" \
+            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            -t localhost/wrapvm:test -f Containerfile .
 
       # The same checks as `make test`: wrap's desktop tests, then wrapvm's own.
       - name: Test mise and agent-browser
@@ -70,6 +92,28 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # One tag per architecture and commit; the publish job joins them.
+      - name: Push this architecture
+        if: github.event_name != 'pull_request'
+        run: |
+          ref="${IMAGE,,}:sha-${GITHUB_SHA}-${{ matrix.arch }}"
+          docker tag localhost/wrapvm:test "$ref"
+          docker push "$ref"
+
+  publish:
+    needs: image
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Tags
         id: meta
         uses: docker/metadata-action@v5
@@ -81,17 +125,11 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=desktop,enable={{is_default_branch}}
             type=sha,format=long
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
 
-      # The same build again, from the cache the first one filled.
-      - name: Publish
-        if: github.event_name != 'pull_request'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Containerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=wrapvm
+      - name: Publish the multi-arch tags
+        run: |
+          src="${IMAGE,,}:sha-${GITHUB_SHA}"
+          args=
+          for t in $(printf '%s\n' "${{ steps.meta.outputs.tags }}"); do args="$args -t $t"; done
+          docker buildx imagetools create $args "$src-amd64" "$src-arm64"
+          docker buildx imagetools inspect "${IMAGE,,}:sha-${GITHUB_SHA}"

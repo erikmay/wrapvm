@@ -20,7 +20,10 @@ name="${base:-wrapvm}-$(printf %s "$dir" | cksum | cut -c1-6)"
 # One machine per directory; it mounts the directory it was created from.
 if ! "$smolvm" machine status --name "$name" >/dev/null 2>&1; then
   ( # a subshell, so the caller's arguments survive
-    set -- machine create --name "$name" -s "$here/Smolfile" -p "$port:6080"
+    # WRAP_UID/WRAP_GID: the Smolfile's init gives the guest `user` these ids,
+    # so the workspace mount (owned by this host user) is writable in the guest.
+    set -- machine create --name "$name" -s "$here/Smolfile" -p "$port:6080" \
+      -e "WRAP_UID=$(id -u)" -e "WRAP_GID=$(id -g)"
     [ -z "${WRAPVM_IMAGE:-}" ] || set -- "$@" --image "$WRAPVM_IMAGE"
     [ -z "${WRAP_DESKTOP_VOXL_ARGS:-}" ] || set -- "$@" -e "WRAP_DESKTOP_VOXL_ARGS=$WRAP_DESKTOP_VOXL_ARGS"
     exec "$smolvm" "$@" >/dev/null

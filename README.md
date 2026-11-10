@@ -1,7 +1,12 @@
 # wrapvm
 
 A desktop VM for agents: [wrap](https://github.com/tobi/wrap)'s desktop image, as one
-`Containerfile` that CI publishes as `ghcr.io/tobi/wrapvm:desktop` and a `Smolfile` that boots it.
+`Containerfile` that CI publishes as `ghcr.io/erikmay/wrapvm:desktop` and a `Smolfile` that boots it.
+
+The image is multi-arch: amd64 and arm64. smolvm pulls the host's own architecture, so on an Apple Silicon
+Mac the machine is a native arm64 microVM on Hypervisor.framework (no Rosetta, no QEMU). The arm64 image is
+built on Arch Linux ARM, from tobi/wrap's `Containerfile.arm64` (wrap publishes no arm64 base), and runs
+Google's Linux arm64 Chrome.
 
 - Xvfb `:1` + XFCE, viewed in a browser through [voxl](https://github.com/tembo/voxl) on 6080 (password; `wrap-desktop url` prints the link)
 - one persistent Google Chrome with CDP on 9222 (9223 on guest interfaces)
@@ -14,13 +19,14 @@ A desktop VM for agents: [wrap](https://github.com/tobi/wrap)'s desktop image, a
 - a prompt that says `[vm:<machine>]` under smolvm, `[container:<host>]` in a container
 
 The `Containerfile` is tobi/wrap's `Containerfile.desktop` at `c562a7d`, plus what wrapvm adds (each block is
-marked `wrapvm:`). wrap keeps the CLI and the base image (`ghcr.io/tobi/wrap:latest`, the `FROM` here).
+marked `wrapvm:`). wrap keeps the CLI and the base image: `ghcr.io/tobi/wrap:latest` on amd64, and on arm64
+wrap's `Containerfile.arm64` at the same commit, built by `make base` and by CI.
 
 ## Files
 
 | File | What |
 | --- | --- |
-| `Containerfile` | The VM. CI builds it, tests it and publishes `ghcr.io/tobi/wrapvm:desktop` (also `:latest`) |
+| `Containerfile` | The VM. CI builds it on amd64 and arm64 runners, tests both and publishes `ghcr.io/erikmay/wrapvm:desktop` (also `:latest`) as one multi-arch tag |
 | `Dockerfile` | A symlink to `Containerfile`, for `docker build .` |
 | `Smolfile` | A smolvm machine booting that image, with the workspace mount, network policy and credentials |
 | `wrapvm` | One machine per directory: create, start, shell in (`wrapvm -- CMD` runs CMD) |
@@ -31,11 +37,15 @@ marked `wrapvm:`). wrap keeps the CLI and the base image (`ghcr.io/tobi/wrap:lat
 
 ```sh
 ./wrapvm                                  # smolvm: machine for $PWD, zsh in it; prints the viewer's sign-in link
-docker run -d -p 127.0.0.1:6080:6080 ghcr.io/tobi/wrapvm:desktop   # or as a container
+docker run -d -p 127.0.0.1:6080:6080 ghcr.io/erikmay/wrapvm:desktop   # or as a container
 docker exec <id> wrap-desktop url         # its sign-in link
 ```
 
 `WRAPVM_DESKTOP_PORT` picks another host port when `wrapvm` creates the machine.
+
+The guest `user` takes your host uid and gid on the machine's first start (`wrap-realign`, run by the
+Smolfile's init with the `WRAP_UID`/`WRAP_GID` that `wrapvm` passes at create), so the mounted workspace is
+writable inside and new files are yours on the host. On macOS that is 501:20; the image is built as 1000.
 
 ## agent-browser config
 
@@ -43,9 +53,26 @@ docker exec <id> wrap-desktop url         # its sign-in link
 missing, `wrap-desktop start` and every login shell write `{"headed": true, "autoConnect": true}`; an
 existing file is never touched. It replaces `~/.agent-browser/config.json`.
 
+## On a Mac (Apple Silicon)
+
+```sh
+brew install smol-machines/tap/smolvm
+./wrapvm                                  # pulls the arm64 image and boots it natively
+```
+
+To boot a local build instead of the published one, build it with Docker (OrbStack, Docker Desktop) or podman:
+
+```sh
+make image.tar                            # arm64: builds wrap's arm64 base first (make base), then the image
+WRAPVM_IMAGE=$PWD/wrapvm.tar ./wrapvm
+```
+
 ## Develop
 
 ```sh
-make test                                 # podman build + tests; CONTAINER_ENGINE=docker works too
+make test                                 # build for this host's arch + tests; podman if present, else docker
 make image.tar && WRAPVM_IMAGE=$PWD/wrapvm.tar ./wrapvm   # boot a local build under smolvm
 ```
+
+`ARCH` (amd64 or arm64) defaults to the host's. On arm64, `make base` builds `localhost/wrap:arm64` from
+tobi/wrap at `WRAP_REV`; `make image BASE_TARGET=` reuses one already built.

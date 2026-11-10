@@ -1,6 +1,6 @@
 # wrapvm: tobi/wrap's desktop (Containerfile.desktop at c562a7d) plus ffmpeg and
 # a workspace agent-browser config. This file is the one definition of the VM:
-# CI publishes it as ghcr.io/tobi/wrapvm:desktop, which the Smolfile boots.
+# CI publishes it as ghcr.io/erikmay/wrapvm:desktop, which the Smolfile boots.
 #
 # wrap desktop: base image + a headless X desktop (Xvfb + XFCE), one persistent
 # Google Chrome on that desktop with CDP on localhost:9222 and every first-run/
@@ -8,8 +8,8 @@
 # to that Chrome — so a human (in the browser viewer) and the agent share the
 # same browser.
 #
-#   docker run -d ghcr.io/tobi/wrapvm:desktop            # desktop + chrome up
-#   docker run -it ghcr.io/tobi/wrapvm:desktop           # shell, desktop autostarts
+#   docker run -d ghcr.io/erikmay/wrapvm:desktop            # desktop + chrome up
+#   docker run -it ghcr.io/erikmay/wrapvm:desktop           # shell, desktop autostarts
 #   -e WRAP_DESKTOP_AUTOSTART=0                          # opt out of autostart
 #
 # The viewer, voxl on :6080, listens on all guest interfaces so the VM/container
@@ -31,8 +31,12 @@ ARG BASE_IMAGE=ghcr.io/tobi/wrap:latest
 FROM ${BASE_IMAGE} AS voxl
 # The base puts mise's shims first on PATH, and cargo there is a lazy install.
 # Arch's own rust is the toolchain here.
+# wrapvm: --disable-sandbox on every build-time pacman. pacman 7 downloads as
+# the `alpm` user under Landlock, which some builders refuse (OrbStack's Docker:
+# "Landlock ruleset could not be applied"); packages are still signature-checked.
+# The image's own pacman.conf keeps the sandbox for pacman inside the VM.
 ENV HOME=/root USER=root CARGO_HOME=/tmp/cargo PATH=/usr/bin:/bin
-RUN pacman -Syu --noconfirm --needed rust esbuild x264 libyuv opus libpulse \
+RUN pacman -Syu --disable-sandbox --noconfirm --needed rust esbuild x264 libyuv opus libpulse \
  && rm -rf /var/cache/pacman/pkg/*
 # Arch's libyuv ships no pkg-config file, and voxl's build.rs asks pkg-config
 # for every library it links.
@@ -102,8 +106,11 @@ ENV DISPLAY=:1 \
 # x264, libyuv, opus and libpulse are what the voxl binary links.
 # wrapvm: pulseaudio is the desktop's sound card, a null sink that voxl streams
 # to the viewer; pulseaudio-alsa routes ALSA's default device into it.
+# wrapvm: procps-ng (ps, pgrep) is in the amd64 base but not in the Arch Linux
+# ARM one; the desktop scripts and tests need it.
+# --disable-sandbox: see the voxl stage.
 # ---------------------------------------------------------------------------
-RUN pacman -Syu --noconfirm --needed \
+RUN pacman -Syu --disable-sandbox --noconfirm --needed \
       xorg-server-xvfb xorg-xauth xorg-xdpyinfo xorg-xset xorg-xrandr xdotool \
       scrot socat x264 libyuv opus libpulse \
       dbus xfce4-session xfwm4 xfdesktop xfce4-panel xfce4-settings xfconf \
@@ -112,7 +119,7 @@ RUN pacman -Syu --noconfirm --needed \
       alsa-lib gtk3 libcups libxss libxtst nss xdg-utils at-spi2-core \
       libxrandr libxcomposite libxdamage libxkbcommon libdrm mesa pango cairo \
       libxshmfence vulkan-icd-loader \
-      ffmpeg pulseaudio pulseaudio-alsa \
+      ffmpeg pulseaudio pulseaudio-alsa procps-ng \
  && dbus-uuidgen --ensure=/etc/machine-id \
  && rm -rf /var/cache/pacman/pkg/*
 
@@ -197,8 +204,11 @@ RUN chmod 0440 /etc/sudoers.d/20-wrap-mise \
 # would also pull every lazy runtime in the base config, and node is named
 # because mise does not fetch a lazy node for an npm tool by itself (it fails
 # with "failed to resolve configured install dependency 'node@latest'").
+# wrapvm: umask 002 keeps the installs group-writable. The arm64 base group-owns
+# /opt/mise with `toolchain`, so after wrap-realign moves `user` to the host's
+# uid (see below) it can still update these tools without a chown of the tree.
 COPY --chown=${WRAP_UID}:${WRAP_GID} resources/mise-desktop.toml /opt/mise/config/conf.d/desktop.toml
-RUN sudo -u "${WRAP_USER_NAME}" -H sh -lc 'mise install node agent-browser npm:agent-desktop'
+RUN sudo -u "${WRAP_USER_NAME}" -H sh -lc 'umask 002 && mise install node agent-browser npm:agent-desktop'
 
 # The viewer, from the voxl stage at the top. Its web client is compiled into
 # the binary, so it serves offline. LD_BIND_NOW makes the loader resolve every
@@ -211,9 +221,16 @@ RUN LD_BIND_NOW=1 voxl --version
 # Google Chrome stable, straight from Google's .deb (the AUR package does the
 # same thing). No dpkg needed: bsdtar unpacks data.tar.* onto /. Cron/apt
 # repo hooks from the package are dropped.
+# wrapvm: the .deb for the build's own architecture. Google ships Linux arm64
+# Chrome, so the arm64 image (Apple Silicon, under smolvm) runs it natively.
 # ---------------------------------------------------------------------------
-RUN curl -fsSL -o /tmp/chrome.deb \
-      https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+RUN case "$(uname -m)" in \
+      x86_64) arch=amd64 ;; \
+      aarch64) arch=arm64 ;; \
+      *) echo "no Google Chrome build for $(uname -m)" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSL -o /tmp/chrome.deb \
+      "https://dl.google.com/linux/direct/google-chrome-stable_current_${arch}.deb" \
  && bsdtar -xOf /tmp/chrome.deb 'data.tar.*' | bsdtar -x -C / \
  && rm -f /tmp/chrome.deb /etc/cron.daily/google-chrome \
  && rm -rf /opt/google/chrome/cron \
@@ -1145,6 +1162,55 @@ RUN cat > /etc/wrap/desktop.md <<'EOF'
   and /wait, which returns once the screen has been still for `idle` ms (300)
   or, with `?change`, at the first change: no sleeping after an action.
 EOF
+
+# ---------------------------------------------------------------------------
+# wrapvm: wrap-realign moves `user` to the host's uid/gid, as the wrap CLI does
+# for its own VMs. A mounted host directory (the workspace) keeps the host's
+# owner inside the guest: 501 on macOS, so `user` (1000) could not write it.
+# The Smolfile's init runs it as root on the machine's first start, before the
+# desktop, with WRAP_UID/WRAP_GID set to the host's ids (./wrapvm sets them at
+# create). It is a no-op when the ids already match (a Linux host as uid 1000).
+# Only paths the old ids own are changed, on this disk only (-xdev skips the
+# workspace mount). /opt/mise is chowned only when `user` cannot write it
+# through the `toolchain` group (the amd64 base has no such group): that is one
+# overlay copy-up per file, which is slow.
+# ---------------------------------------------------------------------------
+RUN cat > /opt/wrap/bin/wrap-realign <<'EOF'
+#!/bin/sh
+# wrap-realign [UID [GID]]: give `user` the host's uid and gid (default
+# $WRAP_UID and $WRAP_GID). Run as root, before anything runs as `user`.
+set -eu
+user="${WRAP_USER_NAME:-user}"
+home="${WRAP_USER_HOME:-/home/user}"
+uid="${1:-${WRAP_UID:-1000}}"
+gid="${2:-${WRAP_GID:-${uid}}}"
+[ "$(id -u)" = 0 ] || { echo "wrap-realign: must run as root" >&2; exit 1; }
+case "$uid$gid" in *[!0-9]*|'') echo "wrap-realign: bad uid/gid: $uid:$gid" >&2; exit 2 ;; esac
+[ "$uid" != 0 ] || { echo "wrap-realign: will not make $user root" >&2; exit 2; }
+
+old_uid=$(id -u "$user")
+old_gid=$(id -g "$user")
+[ "$old_uid" != "$uid" ] || [ "$old_gid" != "$gid" ] || exit 0
+
+if [ "$old_gid" != "$gid" ]; then
+  groupmod -o -g "$gid" "$user"
+fi
+if [ "$old_uid" != "$uid" ]; then
+  usermod -o -u "$uid" -g "$gid" "$user"
+fi
+
+# The home and leftovers in /tmp: small, and on this disk only.
+find "$home" /tmp -xdev \( -uid "$old_uid" -o -gid "$old_gid" \) \
+  -exec chown -h "$uid:$gid" {} + 2>/dev/null || true
+
+# The toolchain: group-writable through `toolchain` on the arm64 base.
+if ! runuser -u "$user" -- sh -c 'test -w /opt/mise && test -w /opt/mise/data && test -w /opt/mise/data/installs' 2>/dev/null; then
+  find /opt/mise -xdev -uid "$old_uid" -exec chown -h "$uid" {} +
+  find /opt/mise -xdev -gid "$old_gid" -exec chgrp -h "$gid" {} +
+fi
+echo "wrap-realign: $user is now $uid:$gid (was $old_uid:$old_gid)" >&2
+EOF
+RUN chmod 0755 /opt/wrap/bin/wrap-realign
 
 # Anything a root build step may have left in the user's home belongs to user.
 # Only touch mis-owned paths: chown -R rewrites every file into a new layer.
