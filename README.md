@@ -30,6 +30,7 @@ wrap's `Containerfile.arm64` at the same commit, built by `make base` and by CI.
 | `Dockerfile` | A symlink to `Containerfile`, for `docker build .` |
 | `Smolfile` | A smolvm machine booting that image, with the workspace mount, network policy and credentials |
 | `wrapvm` | One machine per directory: create, start, shell in (`wrapvm -- CMD` runs CMD) |
+| `wrapvm-watch` | One local page with every wrapvm machine's desktop, live, and a watchdog for their viewers |
 | `skills/` | The `desktop` and `browser` skills, installed into `~/.agents/skills` |
 | `tests/` | wrap's desktop tests and `container_wrapvm.sh`; run by CI and `make test` |
 
@@ -46,6 +47,18 @@ docker exec <id> wrap-desktop url         # its sign-in link
 The guest `user` takes your host uid and gid on the machine's first start (`wrap-realign`, run by the
 Smolfile's init with the `WRAP_UID`/`WRAP_GID` that `wrapvm` passes at create), so the mounted workspace is
 writable inside and new files are yours on the host. On macOS that is 501:20; the image is built as 1000.
+
+## Watch every machine
+
+```sh
+./wrapvm-watch                            # http://127.0.0.1:6060/ (WRAPVM_WATCH_PORT picks another)
+```
+
+One tile per wrapvm machine: a live picture of its desktop, its folder, guest CPU and memory, and the host
+memory its VM holds. A click opens the interactive viewer. As a watchdog it marks a desktop whose viewer stops
+answering and, after `WRAPVM_WATCH_HEAL_SECONDS` (30; 0 turns it off), runs `wrap-desktop start` in it. It
+listens on loopback only and answers only pages served from 127.0.0.1 or localhost. It needs Python 3 and
+`smolvm`. Give each machine its own port: `WRAPVM_DESKTOP_PORT` when `wrapvm` creates it.
 
 ## agent-browser config
 

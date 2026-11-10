@@ -23,7 +23,8 @@ if ! "$smolvm" machine status --name "$name" >/dev/null 2>&1; then
     # WRAP_UID/WRAP_GID: the Smolfile's init gives the guest `user` these ids,
     # so the workspace mount (owned by this host user) is writable in the guest.
     set -- machine create --name "$name" -s "$here/Smolfile" -p "$port:6080" \
-      -e "WRAP_UID=$(id -u)" -e "WRAP_GID=$(id -g)"
+      -e "WRAP_UID=$(id -u)" -e "WRAP_GID=$(id -g)" \
+      --label wrapvm=1 --label "wrapvm.dir=$dir" --label "wrapvm.port=$port"
     [ -z "${WRAPVM_IMAGE:-}" ] || set -- "$@" --image "$WRAPVM_IMAGE"
     [ -z "${WRAP_DESKTOP_VOXL_ARGS:-}" ] || set -- "$@" -e "WRAP_DESKTOP_VOXL_ARGS=$WRAP_DESKTOP_VOXL_ARGS"
     exec "$smolvm" "$@" >/dev/null
