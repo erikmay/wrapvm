@@ -14,7 +14,8 @@ MISE_OFFLINE=1 codex --version | grep -q 'codex'
 ok 'claude and codex are in the image and run with no download'
 
 test "$AGENT_BROWSER_CONFIG" = /home/user/workspace/agent-browser.json
-test "$(jq -c . "$AGENT_BROWSER_CONFIG")" = '{"headed":true,"autoConnect":true}'
+art=/home/user/workspace/.wrapvm/artifacts
+test "$(jq -c . "$AGENT_BROWSER_CONFIG")" = "{\"headed\":true,\"autoConnect\":true,\"downloadPath\":\"$art\",\"screenshotDir\":\"$art\"}"
 test "$(stat -c %u "$AGENT_BROWSER_CONFIG")" = "$(id -u)"
 echo '{"headed": false}' > "$AGENT_BROWSER_CONFIG"
 wrap-agent-browser-config

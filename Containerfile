@@ -108,6 +108,7 @@ ENV DISPLAY=:1 \
 # to the viewer; pulseaudio-alsa routes ALSA's default device into it.
 # wrapvm: procps-ng (ps, pgrep) is in the amd64 base but not in the Arch Linux
 # ARM one; the desktop scripts and tests need it.
+# wrapvm: tmux holds the session ./wrapvm attaches to (see /etc/tmux.conf below).
 # --disable-sandbox: see the voxl stage.
 # ---------------------------------------------------------------------------
 RUN pacman -Syu --disable-sandbox --noconfirm --needed \
@@ -119,7 +120,7 @@ RUN pacman -Syu --disable-sandbox --noconfirm --needed \
       alsa-lib gtk3 libcups libxss libxtst nss xdg-utils at-spi2-core \
       libxrandr libxcomposite libxdamage libxkbcommon libdrm mesa pango cairo \
       libxshmfence vulkan-icd-loader \
-      ffmpeg pulseaudio pulseaudio-alsa procps-ng \
+      ffmpeg pulseaudio pulseaudio-alsa procps-ng tmux \
  && dbus-uuidgen --ensure=/etc/machine-id \
  && rm -rf /var/cache/pacman/pkg/*
 
@@ -453,11 +454,15 @@ RUN for home in /root /home/user; do \
 # wrapvm: agent-browser's config is AGENT_BROWSER_CONFIG, which replaces the
 # ~/.agent-browser/config.json above. It is written once, when missing, from
 # /etc/wrap/agent-browser.json: headed, and attached to the desktop's running
-# Chrome by discovery.
+# Chrome by discovery. Downloads and screenshots go to .wrapvm/artifacts in the
+# workspace, so they are files on the host too and not lost inside the machine;
+# .wrapvm/.gitignore (written with the config) keeps them out of the project's git.
 RUN cat > /etc/wrap/agent-browser.json <<'EOF'
 {
   "headed": true,
-  "autoConnect": true
+  "autoConnect": true,
+  "downloadPath": "/home/user/workspace/.wrapvm/artifacts",
+  "screenshotDir": "/home/user/workspace/.wrapvm/artifacts"
 }
 EOF
 RUN cat > /opt/wrap/bin/wrap-agent-browser-config <<'EOF'
@@ -469,8 +474,12 @@ file="${AGENT_BROWSER_CONFIG:-}"
 dir="$(dirname "$file")"
 [ -d "$dir" ] && [ -w "$dir" ] || exit 0
 (set -C; cat /etc/wrap/agent-browser.json > "$file") 2>/dev/null || exit 0
+# The artifacts directory's parent ignores itself in git.
+if mkdir -p "$dir/.wrapvm" 2>/dev/null && [ ! -e "$dir/.wrapvm/.gitignore" ]; then
+  printf '*\n' > "$dir/.wrapvm/.gitignore"
+fi
 # Written by root (a sudo -i shell): it still belongs to the workspace's owner.
-[ "$(id -u)" != 0 ] || chown "$(stat -c %u:%g "$dir")" "$file"
+[ "$(id -u)" != 0 ] || chown -R "$(stat -c %u:%g "$dir")" "$file" "$dir/.wrapvm"
 EOF
 # The image's own workspace gets it now, for a container without a workspace
 # mount: agent-browser refuses to run while AGENT_BROWSER_CONFIG names a
@@ -1195,6 +1204,91 @@ RUN cat > /etc/wrap/desktop.md <<'EOF'
   or `curl -u ":$(wrap-desktop password)"`: GET localhost:6080/screenshot (PNG),
   and /wait, which returns once the screen has been still for `idle` ms (300)
   or, with `?change`, at the first change: no sleeping after an action.
+EOF
+
+# ---------------------------------------------------------------------------
+# wrapvm: project hooks, with the file names Amp's orbs use, so one repository
+# serves both. ./wrapvm runs wrap-hooks after the machine starts:
+#   .agents/setup   once per machine, and again when the file changes: install
+#                   what the project needs. It must be safe to run again.
+#   .agents/resume  once per boot of the machine, after setup: start services.
+#                   wrap-hooks waits 10 s for it, then it runs on in the
+#                   background.
+# Both run from the workspace as `user` in a login shell's environment. A failed
+# setup is reported and tried again on the next run; resume waits for a setup
+# that passed. State is kept per uid under /var/lib/wrap-hooks, on the
+# machine's own disk; logs are in ~/.cache/wrapvm/logs.
+# ---------------------------------------------------------------------------
+RUN install -d -m 1777 /var/lib/wrap-hooks \
+ && cat > /opt/wrap/bin/wrap-hooks <<'EOF'
+#!/bin/sh
+# wrap-hooks: run the workspace's .agents/setup and .agents/resume when due.
+set -u
+ws="${WRAP_HOOKS_WORKSPACE:-/home/user/workspace}"
+state="/var/lib/wrap-hooks/$(id -u)"
+logs="$HOME/.cache/wrapvm/logs"
+say() { printf 'wrapvm: %s\n' "$*" >&2; }
+[ -f "$ws/.agents/setup" ] || [ -f "$ws/.agents/resume" ] || exit 0
+mkdir -p "$state" "$logs" || exit 0
+cd "$ws" || exit 0
+
+# An executable hook runs by its own first line; any other file runs with bash.
+hook() { if [ -x "$1" ]; then "$1"; else bash "$1"; fi; }
+
+if [ -f .agents/setup ]; then
+  sum="$(sha256sum < .agents/setup)"
+  if [ "$(cat "$state/setup.sha256" 2>/dev/null)" != "$sum" ]; then
+    say "running .agents/setup (log: $logs/setup.log)"
+    rm -f "$state/setup.sha256"
+    { WRAPVM_HOOK=setup hook .agents/setup </dev/null; echo $? > "$state/setup.status"; } 2>&1 \
+      | tee "$logs/setup.log" >&2
+    status="$(cat "$state/setup.status" 2>/dev/null || echo 1)"
+    if [ "$status" != 0 ]; then
+      say ".agents/setup failed (exit $status); it runs again on the next wrapvm"
+      exit 1
+    fi
+    printf '%s\n' "$sum" > "$state/setup.sha256"
+    say ".agents/setup done"
+  fi
+fi
+
+if [ -f .agents/resume ]; then
+  boot="$(cat /proc/sys/kernel/random/boot_id)"
+  if [ "$(cat "$state/resume.boot" 2>/dev/null)" != "$boot" ]; then
+    printf '%s\n' "$boot" > "$state/resume.boot"
+    rm -f "$state/resume.status"
+    say "running .agents/resume (log: $logs/resume.log)"
+    # Its own session, so it and what it starts outlive this command.
+    WRAPVM_HOOK=resume setsid sh -c '
+      if [ -x .agents/resume ]; then .agents/resume; else bash .agents/resume; fi
+      echo $? > "$1"' resume "$state/resume.status" >"$logs/resume.log" 2>&1 </dev/null &
+    i=0
+    while [ ! -f "$state/resume.status" ] && [ "$i" -lt 100 ]; do i=$((i + 1)); sleep 0.1; done
+    if [ ! -f "$state/resume.status" ]; then
+      say ".agents/resume is still running in the background"
+    elif [ "$(cat "$state/resume.status")" != 0 ]; then
+      say ".agents/resume failed (exit $(cat "$state/resume.status")):"
+      tail -n 20 "$logs/resume.log" >&2
+    fi
+  fi
+fi
+exit 0
+EOF
+RUN chmod 0755 /opt/wrap/bin/wrap-hooks
+
+# wrapvm: ./wrapvm opens tmux session `main`, so an agent keeps running when the
+# terminal closes and the next ./wrapvm is back in it. Panes are login shells
+# (tmux's default), so they get the profile. The mouse scrolls and selects,
+# and a selection reaches the host's clipboard (OSC 52).
+RUN cat > /etc/tmux.conf <<'EOF'
+set -g mouse on
+set -g history-limit 50000
+set -g default-terminal "tmux-256color"
+set -ga terminal-overrides ",*256col*:Tc"
+set -s escape-time 10
+set -s set-clipboard on
+set -g status-left "[#S] "
+set -g status-right "#H"
 EOF
 
 # ---------------------------------------------------------------------------

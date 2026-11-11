@@ -52,6 +52,24 @@ The guest `user` takes your host uid and gid on the machine's first start (`wrap
 Smolfile's init with the `WRAP_UID`/`WRAP_GID` that `wrapvm` passes at create), so the mounted workspace is
 writable inside and new files are yours on the host. On macOS that is 501:20; the image is built as 1000.
 
+## Project hooks
+
+Two optional scripts in the project, with the names Amp's orbs use, so one repository serves both:
+
+| File | When `wrapvm` runs it | For |
+| --- | --- | --- |
+| `.agents/setup` | Once per machine, and again when the file changes | Installing what the project needs. Must be safe to run again |
+| `.agents/resume` | Once per boot of the machine, after setup | Starting services. `wrapvm` waits 10 s, then it runs on in the background |
+
+Both run in the workspace as `user`. A failed setup is reported, the shell still opens, and the next `wrapvm`
+tries it again. Logs: `~/.cache/wrapvm/logs/setup.log` and `resume.log` in the machine. `WRAPVM_HOOKS=0` skips both.
+
+## Terminal session
+
+`wrapvm` opens tmux session `main` in the machine: an agent keeps running when the terminal closes, and the
+next `wrapvm` is back in it. Detach with `Ctrl-b d`. The mouse scrolls and selects. `WRAPVM_TMUX=0` gives a
+plain zsh; `wrapvm -- CMD` runs CMD with no tmux.
+
 ## Watch every machine
 
 ```sh
@@ -69,7 +87,9 @@ listens on loopback only and answers only pages served from 127.0.0.1 or localho
 ## agent-browser config
 
 `AGENT_BROWSER_CONFIG=/home/user/workspace/agent-browser.json` is set everywhere. When that file is
-missing, `wrap-desktop start` and every login shell write `{"headed": true, "autoConnect": true}`; an
+missing, `wrap-desktop start` and every login shell write the default: headed, attached to the desktop's
+Chrome, and downloads and screenshots in `.wrapvm/artifacts` in the workspace (so on the host too; a
+`.wrapvm/.gitignore` keeps them out of git); an
 existing file is never touched. It replaces `~/.agent-browser/config.json`.
 
 ## On a Mac (Apple Silicon)
