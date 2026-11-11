@@ -62,7 +62,7 @@ else
 fi
 
 # Credentials are read from this environment when the machine starts
-# (a no-op when it is already running): GitHub from gh, pi's ANTHROPIC_API_KEY as is.
+# (a no-op when it is already running): GitHub from gh, claude's ANTHROPIC_API_KEY as is.
 if token=$(gh auth token 2>/dev/null) && [ -n "$token" ]; then
   GH_TOKEN="Basic $(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')"
   export GH_TOKEN

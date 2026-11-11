@@ -1,4 +1,11 @@
 [tools]
+# wrapvm: the two coding agents, in the image so every machine shares one copy
+# and a first start downloads nothing. Both are single native binaries. Like
+# the tools below they follow tool_update.global_auto: a machine fetches a
+# newer release before a launch once mise's check interval has passed.
+claude = { version = "latest" }
+codex = { version = "latest" }
+
 # Both agent CLIs are installed into the image at build time (the desktop
 # Containerfile runs `mise install` for them), so a fresh machine uses them with
 # no download. They are not lazy on purpose: `lazy = true` would only create the

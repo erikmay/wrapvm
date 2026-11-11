@@ -173,6 +173,12 @@ RUN chmod 0644 /opt/wrap/bin/wrap-mise-env \
  && printf '%s\n' '[ -r /opt/wrap/bin/wrap-mise-env ] && . /opt/wrap/bin/wrap-mise-env' \
       >> /etc/profile.d/wrap.sh
 
+# wrapvm: when the machine runs out of memory, the kernel kills what was started
+# from a shell (an agent, its builds, a terminal's commands) before the desktop
+# and the shared Chrome. A process may raise its own score, and children
+# inherit it; wrap-desktop sets its own back to 0 and protects its servers.
+RUN printf '%s\n' 'echo 500 >/proc/self/oom_score_adj 2>/dev/null || true' >> /etc/profile.d/wrap.sh
+
 # `sudo -E` would carry the user's MISE_CACHE_DIR/MISE_STATE_DIR into a root
 # shell, and root's mise would then leave root-owned locks and a root-owned
 # trust state in the user's directory: the user's next install fails on files it
@@ -208,7 +214,9 @@ RUN chmod 0440 /etc/sudoers.d/20-wrap-mise \
 # /opt/mise with `toolchain`, so after wrap-realign moves `user` to the host's
 # uid (see below) it can still update these tools without a chown of the tree.
 COPY --chown=${WRAP_UID}:${WRAP_GID} resources/mise-desktop.toml /opt/mise/config/conf.d/desktop.toml
-RUN sudo -u "${WRAP_USER_NAME}" -H sh -lc 'umask 002 && mise install node agent-browser npm:agent-desktop'
+# wrapvm: claude and codex are installed here too (see mise-desktop.toml), not
+# by the machine's first start: one shared copy instead of one per machine.
+RUN sudo -u "${WRAP_USER_NAME}" -H sh -lc 'umask 002 && mise install node agent-browser npm:agent-desktop claude codex'
 
 # The viewer, from the voxl stage at the top. Its web client is compiled into
 # the binary, so it serves offline. LD_BIND_NOW makes the loader resolve every
@@ -842,6 +850,10 @@ log="$run_dir/desktop.log"
 # out on Arch, so without this xfce4-session starts but never spawns xfwm4,
 # the panel or xfdesktop (xfconf needs the bus). Same values are exported to
 # login shells by /etc/profile.d/wrap-desktop.sh so later GUI launches join it.
+# wrapvm: a login shell marks itself as the first to go when memory runs out
+# (see protect below); the desktop this script starts from one must not
+# inherit that. Going back to 0 needs no privilege.
+echo 0 >/proc/self/oom_score_adj 2>/dev/null || true
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-$run_dir/runtime}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
 # The desktop's children (XFCE, terminals, Chrome) are not login shells, so they
@@ -940,6 +952,26 @@ spawn() { # name cmd...
   fi
   setsid "$@" >>"$log" 2>&1 </dev/null &
   echo $! >"$run_dir/$name.pid"
+  case "$name" in xvfb|dbus|viewer|pulse|cdp-public) protect "$!" ;; esac
+}
+
+# wrapvm: the desktop's own servers are the last thing the kernel kills when
+# the machine runs out of memory. Without this a build that forks many small
+# processes got Xvfb killed (each process is smaller than the X server, so it
+# was the pick), and with X go every window and the Chrome session. -900
+# keeps these servers; /etc/profile.d/wrap.sh gives every shell, and so the
+# agents and builds started from one, +500, which keeps Chrome and XFCE (0):
+# with the servers alone protected the kernel took Chrome next. Only servers that start no user programs are
+# named in spawn: a child inherits the score, so the XFCE session and Chrome,
+# whose children are terminals and whatever runs in them, keep the default.
+# Lowering a score needs root: sudo here, a no-op where it is refused (Docker
+# without CAP_SYS_RESOURCE).
+protect() { # pid
+  if [ "$(id -u)" = 0 ]; then
+    echo -900 >"/proc/$1/oom_score_adj"
+  else
+    sudo -n sh -c "echo -900 > /proc/$1/oom_score_adj"
+  fi 2>/dev/null || true
 }
 
 start() {
@@ -1199,6 +1231,12 @@ if [ "$old_gid" != "$gid" ]; then
 fi
 if [ "$old_uid" != "$uid" ]; then
   usermod -o -u "$uid" -g "$gid" "$user"
+fi
+
+# Sound: PulseAudio clients find the desktop's server through a path that
+# names the uid (/tmp/wrap-desktop-<uid>/runtime/pulse/native).
+if [ "$old_uid" != "$uid" ] && [ -f /etc/pulse/client.conf.d/50-wrapvm.conf ]; then
+  sed -i "s#/tmp/wrap-desktop-$old_uid/#/tmp/wrap-desktop-$uid/#" /etc/pulse/client.conf.d/50-wrapvm.conf
 fi
 
 # The home and leftovers in /tmp: small, and on this disk only.

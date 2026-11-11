@@ -19,13 +19,12 @@ user = "user"
 workdir = "/home/user/workspace"
 volumes = [".:/home/user/workspace"]   # the directory you create the machine from
 
-# First start only, as root. wrap-realign first: it moves `user` to the host's
-# uid/gid (WRAP_UID/WRAP_GID, which ./wrapvm sets at create) so the mounted
-# workspace is writable; on macOS the host owner is 501, not the image's 1000.
-# Then install the agents as `user` into the image's mise tree.
+# First start only, as root: wrap-realign moves `user` to the host's uid/gid
+# (WRAP_UID/WRAP_GID, which ./wrapvm sets at create) so the mounted workspace
+# is writable; on macOS the host owner is 501, not the image's 1000.
+# Nothing is installed here: claude and codex are in the image.
 init = [
   "/opt/wrap/bin/wrap-realign",
-  "/opt/wrap/bin/wrap-entrypoint mise use --global --pin --yes --jobs 4 -- pi@latest github:can1357/oh-my-pi@latest codex@latest claude@latest",
 ]
 
 [network]
@@ -43,7 +42,7 @@ environment_variable = "GH_TOKEN"
 allowed_hosts = ["github.com", "api.github.com"]
 set_header = "authorization"
 
-# pi: the guest's ANTHROPIC_API_KEY is a placeholder; the host swaps in its own
+# claude: the guest's ANTHROPIC_API_KEY is a placeholder; the host swaps in its own
 # ANTHROPIC_API_KEY on requests to api.anthropic.com only.
 [[network.credentials]]
 name = "anthropic"

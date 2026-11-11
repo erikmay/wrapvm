@@ -15,7 +15,10 @@ Google's Linux arm64 Chrome.
 - `desktop` and `browser` skills in `~/.agents/skills`, pointing agents at those two CLIs' own guides
 - sound: PulseAudio with a null sink, streamed by the viewer and recordable with ffmpeg
 - the shared Chrome as the default browser (xdg-open, XFCE, `$BROWSER`), with its sandbox on
+- [Claude Code](https://claude.com/claude-code) and Codex, in the image: a new machine downloads nothing
 - ffmpeg
+- out-of-memory order: what a shell starts (an agent, its builds) is killed first, then Chrome and XFCE, and
+  the display, viewer and sound servers last, so a runaway build does not take the desktop down
 - a prompt that says `[vm:<machine>]` under smolvm, `[container:<host>]` in a container
 
 The `Containerfile` is tobi/wrap's `Containerfile.desktop` at `c562a7d`, plus what wrapvm adds (each block is
